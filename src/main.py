@@ -15,20 +15,18 @@ from src.agents.director_agent import DirectorAgent
 from src.agents.reviewer_agent import ReviewerAgent
 from src.graph.narrative_graph import NarrativeGraph
 from src.story_state import StoryStateManager
+from src.scenarios import load_scenario, DEFAULT_SCENARIO_ID
 
 async def main():
-    # Load seed story from examples
-    # Assuming examples is in project root
-    examples_dir = project_root / "examples" / "rickshaw_accident"
-    
-    seed_story = json.loads((examples_dir / "seed_story.json").read_text())
-    
-    # Load character configs
-    char_configs = json.loads((examples_dir / "character_configs.json").read_text())
-    
+    # Load scenario (story, characters, prompts) — pass an id as argv[1] to pick another one
+    scenario_id = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_SCENARIO_ID
+    scenario = load_scenario(scenario_id)
+    seed_story = {k: scenario.get(k) for k in ("title", "description", "setting")}
+    char_configs = {"characters": scenario["characters"]}
+
     # Initialize config
-    config = StoryConfig()
-    
+    config = StoryConfig.from_scenario(scenario)
+
     # Create character agents
     characters = [
         CharacterAgent(

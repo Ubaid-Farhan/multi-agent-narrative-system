@@ -4,16 +4,12 @@ from .base_agent import BaseAgent
 from ..config import StoryConfig
 from ..schemas import StoryState
 from ..actions import get_action_count
-from ..prompts.director_prompts import (
-    DIRECTOR_SELECT_SPEAKER_PROMPT,
-    DIRECTOR_CONCLUSION_PROMPT,
-    DIRECTOR_TWIST_PROMPT
-)
 
 
 class DirectorAgent(BaseAgent):
     def __init__(self, config: StoryConfig):
         super().__init__("Director", config)
+        self.prompts = config.scenario["prompts"]
 
     def _format_world_state(self, state: StoryState) -> str:
         """Format world_state for prompt."""
@@ -56,7 +52,7 @@ class DirectorAgent(BaseAgent):
             story_state, available_characters
         )
 
-        prompt = DIRECTOR_SELECT_SPEAKER_PROMPT.format(
+        prompt = self.prompts["director_select_speaker"].format(
             description=story_state.seed_story.get('description', ''),
             world_state_text=self._format_world_state(story_state),
             recent_dialogue=recent_dialogue,
@@ -115,7 +111,7 @@ class DirectorAgent(BaseAgent):
 
         character_descriptions = self._build_character_descriptions(story_state)
 
-        prompt = DIRECTOR_TWIST_PROMPT.format(
+        prompt = self.prompts["director_twist"].format(
             story_summary=story_summary,
             world_state_text=self._format_world_state(story_state),
             character_descriptions=character_descriptions,
@@ -139,7 +135,7 @@ class DirectorAgent(BaseAgent):
 
         character_descriptions = self._build_character_descriptions(story_state)
 
-        prompt = DIRECTOR_CONCLUSION_PROMPT.format(
+        prompt = self.prompts["director_conclusion"].format(
             story_summary=f"Context: {story_state.seed_story.get('description', '')}\nLast Turns:\n" +
                           "\n".join([f"{t.speaker}: {t.dialogue}" for t in story_state.dialogue_history[-10:]]),
             world_state_text=self._format_world_state(story_state),

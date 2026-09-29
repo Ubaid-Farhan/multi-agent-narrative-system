@@ -1,42 +1,9 @@
 import { useState, useEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { ChevronLeft, ChevronRight, Play, RotateCcw, Volume2, Square } from 'lucide-react';
+import { ChevronLeft, ChevronRight, Play, RotateCcw, Volume2, Square, Settings } from 'lucide-react';
 import { Button } from './components/button';
+import { API_BASE, assetUrl, colorsFor } from './lib/api';
 import './App.css';
-
-const characterImages = {
-  saleem: "img4.png",
-  raza: "img10.png",
-  ahmed: "img3.png",
-  jameel: "img9.png"
-};
-
-const sceneBackgrounds = {
-  main: "img12.png",
-};
-
-const API_BASE = import.meta.env.VITE_API_URL ?? "http://localhost:8080";
-
-const characterColors = {
-  saleem:  { bg: "from-amber-500 to-orange-600", text: "text-amber-900", bubble: "bg-amber-50 border-amber-300" },
-  ahmed:   { bg: "from-blue-600 to-indigo-700",  text: "text-blue-900",  bubble: "bg-blue-50 border-blue-300" },
-  raza:    { bg: "from-slate-500 to-slate-700",  text: "text-slate-900", bubble: "bg-slate-50 border-slate-300" },
-  jameel:  { bg: "from-emerald-500 to-teal-600", text: "text-emerald-900", bubble: "bg-emerald-50 border-emerald-300" }
-};
-
-const characterNames = {
-  saleem: "Saleem (Rickshaw Driver)",
-  ahmed:  "Ahmed Malik (BMW Driver)",
-  raza:   "Constable Raza",
-  jameel: "Uncle Jameel (Tea Vendor)"
-};
-
-const characterVoices = {
-  saleem: "Saleem",
-  ahmed:  "Ahmed Malik",
-  raza:   "Constable Raza",
-  jameel: "Uncle Jameel",
-};
 
 function WaveformIcon() {
   const bar = (delay) => (
@@ -79,11 +46,20 @@ export default function Home() {
   const audioRef = useRef(null);
   const isAutoPlayingRef = useRef(false);
 
+  const [scenarios, setScenarios] = useState([]);
+  const [scenarioId, setScenarioId] = useState(null);
+  const [scenarioInfo, setScenarioInfo] = useState(null);
+
   const totalTurns = storyData?.turns?.length ?? 0;
+
+  const characters = scenarioInfo?.characters ?? [];
+  const charByKey = Object.fromEntries(characters.map((c) => [c.key, c]));
+  const colorsOf = (key) => colorsFor(charByKey[key]?.color);
 
   useEffect(() => {
     const controller = new AbortController();
     (async () => {
+      let lastScenario = null;
       try {
         const res = await fetch(`${API_BASE}/api/story`, { signal: controller.signal });
         if (res.ok) {
@@ -91,12 +67,31 @@ export default function Home() {
           if (data?.turns?.length) {
             setStoryData(data);
             setCurrentTurn(-1);
+            lastScenario = data.scenarioId ?? null;
           }
+        }
+      } catch (_) {}
+      try {
+        const res = await fetch(`${API_BASE}/api/scenarios`, { signal: controller.signal });
+        if (res.ok) {
+          const data = await res.json();
+          setScenarios(data.scenarios ?? []);
+          setScenarioId(lastScenario ?? data.default ?? data.scenarios?.[0]?.id ?? null);
         }
       } catch (_) {}
     })();
     return () => controller.abort();
   }, []);
+
+  useEffect(() => {
+    if (!scenarioId) return;
+    const controller = new AbortController();
+    fetch(`${API_BASE}/api/scenarios/${encodeURIComponent(scenarioId)}`, { signal: controller.signal })
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => data && setScenarioInfo(data))
+      .catch(() => {});
+    return () => controller.abort();
+  }, [scenarioId]);
 
   useEffect(() => {
     if (currentTurn >= 0) {
@@ -154,7 +149,7 @@ export default function Home() {
   const startStory = () => {
     setIsLoading(true);
     setRunError(null);
-    const url = `${API_BASE}/api/run/stream?lang=${language}`;
+    const url = `${API_BASE}/api/run/stream?lang=${language}&scenario=${encodeURIComponent(scenarioId ?? "")}`;
     const es = new EventSource(url);
     let story = { title: null, scenario: null, turns: [], conclusion: "" };
     es.onmessage = (ev) => {
@@ -175,6 +170,10 @@ export default function Home() {
           es.close();
           setCurrentTurn(-1);
           setIsLoading(false);
+        } else if (data.type === "error") {
+          es.close();
+          setIsLoading(false);
+          setRunError(data.message || "Story could not be started. Please try again.");
         }
       } catch (_) {}
     };
@@ -213,12 +212,12 @@ export default function Home() {
     stopAudio();
     const text = turn.dialogue || "";
     if (!text.trim()) return;
-    const speaker = characterVoices[turn.character] || "";
+    const speaker = charByKey[turn.character]?.name || turn.speaker || "";
     setIsTTSLoading(true);
     let blobUrl = null;
     try {
       const res = await fetch(
-        `${API_BASE}/api/tts?text=${encodeURIComponent(text)}&speaker=${encodeURIComponent(speaker)}`
+        `${API_BASE}/api/tts?text=${encodeURIComponent(text)}&speaker=${encodeURIComponent(speaker)}&scenario=${encodeURIComponent(scenarioId ?? "")}`
       );
       if (!res.ok) { setIsTTSLoading(false); return; }
       const blob = await res.blob();
@@ -278,7 +277,7 @@ export default function Home() {
       {/* ── Full-bleed scene ── */}
       <div className="relative overflow-hidden flex-1" style={{ minHeight: 'calc(100vh - 260px)' }}>
         <img
-          src={sceneBackgrounds.main}
+          src={assetUrl(scenarioInfo?.background_image) || "/img12.png"}
           alt="Scene"
           className="absolute inset-0 w-full h-full object-cover"
         />
@@ -287,9 +286,9 @@ export default function Home() {
         {/* Title overlay */}
         <div className="absolute top-0 left-0 right-0 z-10 px-6 pt-5 pb-10 bg-linear-to-b from-black/70 to-transparent pointer-events-none">
           <h1 className="text-2xl md:text-3xl font-bold text-white tracking-tight drop-shadow-lg">
-            {storyData?.title ?? "The Rickshaw Accident"}
+            {storyData?.title ?? scenarioInfo?.title ?? ""}
           </h1>
-          <p className="text-amber-300/80 text-sm mt-0.5">Shahrah-e-Faisal, Karachi</p>
+          {scenarioInfo?.subtitle && <p className="text-amber-300/80 text-sm mt-0.5">{scenarioInfo.subtitle}</p>}
         </div>
 
         {/* Start Story */}
@@ -304,6 +303,23 @@ export default function Home() {
                 <p className="text-gray-200 text-lg leading-relaxed mb-4">
                   Run the full narrative once. This may take a few minutes.
                 </p>
+
+                {/* Scenario picker */}
+                {scenarios.length > 0 && (
+                  <div className="mb-6">
+                    <label htmlFor="scenario" className="block text-gray-400 text-sm mb-3 text-center">Kahani / Scenario</label>
+                    <select
+                      id="scenario"
+                      value={scenarioId ?? ""}
+                      onChange={(e) => setScenarioId(e.target.value)}
+                      className="block mx-auto bg-white/10 border border-white/20 text-gray-100 rounded-xl px-4 py-2.5 text-sm min-w-64"
+                    >
+                      {scenarios.map((sc) => (
+                        <option key={sc.id} value={sc.id} className="bg-gray-900">{sc.title}</option>
+                      ))}
+                    </select>
+                  </div>
+                )}
 
                 {/* Language toggle */}
                 <div className="mb-6">
@@ -342,6 +358,9 @@ export default function Home() {
                     {isLoading ? "Running story..." : "Start story"}
                   </Button>
                 </div>
+                <a href="/admin" className="mt-6 flex items-center justify-center gap-1.5 text-xs text-gray-400! hover:text-amber-300!">
+                  <Settings className="w-3.5 h-3.5" /> Admin panel
+                </a>
               </div>
             </motion.div>
           )}
@@ -407,11 +426,11 @@ export default function Home() {
                 className="flex flex-col items-center"
               >
                 <img
-                  src={characterImages[currentData.character]}
+                  src={assetUrl(charByKey[currentData.character]?.image)}
                   alt={currentData.speaker}
                   className="h-48 md:h-72 object-contain drop-shadow-2xl"
                 />
-                <div className={`mt-1 px-3 py-0.5 rounded-full bg-linear-to-r ${characterColors[currentData.character].bg} text-white text-xs font-semibold shadow-lg whitespace-nowrap`}>
+                <div className={`mt-1 px-3 py-0.5 rounded-full bg-linear-to-r ${colorsOf(currentData.character).bg} text-white text-xs font-semibold shadow-lg whitespace-nowrap`}>
                   {currentData.speaker}
                 </div>
               </motion.div>
@@ -432,7 +451,7 @@ export default function Home() {
                       style={{ cursor: isTyping ? 'pointer' : 'default' }}
                     >
                       {/* Character name header */}
-                      <div className={`px-4 py-2 bg-linear-to-r ${characterColors[currentData.character].bg} flex items-center justify-between`}>
+                      <div className={`px-4 py-2 bg-linear-to-r ${colorsOf(currentData.character).bg} flex items-center justify-between`}>
                         <span className="text-white text-xs font-bold uppercase tracking-wider drop-shadow">
                           {currentData.speaker}
                         </span>
@@ -454,8 +473,8 @@ export default function Home() {
                         </button>
                       </div>
                       {/* Dialogue body */}
-                      <div className={`${characterColors[currentData.character].bubble} border-2 border-t-0 rounded-b-2xl p-4 md:p-5`}>
-                        <p className={`text-sm md:text-base leading-relaxed ${characterColors[currentData.character].text} min-h-[2em]`}>
+                      <div className={`${colorsOf(currentData.character).bubble} border-2 border-t-0 rounded-b-2xl p-4 md:p-5`}>
+                        <p className={`text-sm md:text-base leading-relaxed ${colorsOf(currentData.character).text} min-h-[2em]`}>
                           {displayedText.split('\n').map((line, i, arr) => (
                             <span key={i}>
                               {line}
@@ -636,7 +655,7 @@ export default function Home() {
       {/* Character cards */}
       {storyData && (
         <div className="bg-gray-950 px-4 pb-4 pt-2 grid grid-cols-2 md:grid-cols-4 gap-3 border-t border-white/10">
-          {Object.entries(characterNames).map(([key, name]) => (
+          {characters.map(({ key, label: name, image }) => (
             <div
               key={key}
               className={`flex items-center gap-3 rounded-xl p-3 border transition-colors ${
@@ -647,7 +666,7 @@ export default function Home() {
             >
               <div className="w-14 h-14 shrink-0 rounded-lg overflow-hidden bg-gray-800 flex items-center justify-center">
                 <img
-                  src={characterImages[key]}
+                  src={assetUrl(image)}
                   alt={name}
                   className="w-full h-full object-contain object-center"
                 />

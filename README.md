@@ -71,7 +71,7 @@ This starts both the FastAPI backend (port 8000) and Vite frontend (port 5173) u
 ```bash
 uv run python src/main.py
 ```
-(Run from repo root so `src` and `examples` resolve.)
+(Run from repo root so `src` and `scenarios` resolve.)
 
 ### Run Backend API Only
 ```bash
@@ -83,8 +83,31 @@ npm run dev:api
 npm run dev:frontend
 ```
 
+### Admin Panel (edit stories without touching code)
+1. Set a password in `.env`: `ADMIN_PASSWORD=your-password`, then restart the API.
+2. Open http://localhost:5173/admin and log in.
+3. Tabs:
+   - **Story**: title, subtitle, story seed, setting details, background image
+   - **Characters**: add/remove characters; name, label, image, colour, description, goals, inventory, deep persona, English-mode style, reviewer notes, repeated-appeal keywords, TTS voice
+   - **Prompts**: every Director, Reviewer and character prompt template, with clickable placeholders. Saving is blocked if a placeholder is unknown or a required one is missing.
+   - **Settings**: max/min turns, twist turn, turns after twist, min actions, dialogue length, temperature
+4. **New** copies the current scenario into a new one, which you then edit. Pick the scenario on the player's start screen.
+
+Everything is stored in `scenarios/<id>/scenario.json` (uploaded images in `scenarios/<id>/images/`). The next story run uses the saved changes; no restart needed.
+Note: on hosts with an ephemeral disk (e.g. Hugging Face Spaces), edits made through the panel are lost on restart. Commit `scenarios/` to keep them.
+
+### Saved Stories & Fallback (Neon Postgres)
+Set `DATABASE_URL` in `.env` (any Postgres; Neon recommended). The `stories` table is created automatically.
+
+- Every story that **completes** (has an ending and no failed `...` turns) is saved exactly as shown in the player.
+- Before starting a story, the API makes one tiny LLM call. If it fails (API key invalid, quota exhausted), a saved story for the same scenario is replayed as-is, turn by turn (`REPLAY_TURN_DELAY` seconds apart). Same language is preferred; the least-shown story is picked first.
+- `GET /api/run/stream?mode=auto|live|saved`: `auto` (default) = live, or replay if the LLM is down; `live` = always generate; `saved` = always replay.
+- Without `DATABASE_URL`, or if the database is unreachable, stories still run live; they just aren't saved.
+
+To run the CLI with another scenario: `uv run python src/main.py <scenario_id>`.
+
 The system will:
-1. Load the seed story and character configurations from `examples/rickshaw_accident/`.
+1. Load the scenario (story, characters, personas, prompts, settings) from `scenarios/rickshaw_accident/scenario.json`.
 2. Initialize 4 character agents + 1 Director agent + 1 Reviewer agent.
 3. Run the narrative loop (15-25 turns) with open-ended actions, memory updates, an LLM-generated twist, and per-turn reviewer checks.
 4. Generate `story_output.json` and `prompts_log.json`.
@@ -312,8 +335,7 @@ The problem statement requires Memory, Actions, and Reasoning. Our system adds *
 | `src/agents/character_agent.py` | CharacterAgent — structured JSON reasoning + dialogue + action |
 | `src/agents/director_agent.py` | DirectorAgent — speaker selection, twist generation, conclusion checking |
 | `src/agents/reviewer_agent.py` | ReviewerAgent — Karachi realism, language, repetition, action logic checks |
-| `src/prompts/character_prompts.py` | Deep psychological personas with tactical evolution per character |
-| `src/prompts/director_prompts.py` | Director prompts: speaker selection, twist generation, conclusion |
-| `examples/rickshaw_accident/seed_story.json` | Story seed with setting details (vehicles, location, weather) |
-| `examples/rickshaw_accident/character_configs.json` | 4 character profiles with goals, inventory, descriptions |
+| `scenarios/<id>/scenario.json` | Everything the LLM sees for one story: seed + setting, characters (persona, English style, appeals, reviewer notes, voice, image), Director/Reviewer/character prompt templates, and story settings. Edit it from the admin panel at `/admin`. |
+| `src/scenarios.py` | Loads, validates (placeholders, settings) and saves scenarios |
+| `src/prompts/character_prompts.py` | Builds a character's prompt from the scenario's templates |
 | `Hackthon_Frontend_IBA/frontend/` | React + Vite frontend for real-time story viewing |
