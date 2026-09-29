@@ -15,17 +15,26 @@ from src.agents.director_agent import DirectorAgent
 from src.agents.reviewer_agent import ReviewerAgent
 from src.graph.narrative_graph import NarrativeGraph
 from src.story_state import StoryStateManager
-from src.scenarios import load_scenario, DEFAULT_SCENARIO_ID
+from src.scenarios import DEFAULT_SCENARIO_ID
+from src import db
+from src import scenario_store as store
+from src.run_recorder import RunRecorder
 
 async def main():
     # Load scenario (story, characters, prompts) — pass an id as argv[1] to pick another one
     scenario_id = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_SCENARIO_ID
-    scenario = load_scenario(scenario_id)
+    await db.init_db()
+    scenario = await store.load_scenario(scenario_id)
     seed_story = {k: scenario.get(k) for k in ("title", "description", "setting")}
     char_configs = {"characters": scenario["characters"]}
 
     # Initialize config
     config = StoryConfig.from_scenario(scenario)
+
+    # Record the run in the database (no-op without DATABASE_URL)
+    recorder = RunRecorder(scenario, config.language, source="cli")
+    await recorder.start()
+    config.recorder = recorder
 
     # Create character agents
     characters = [
@@ -51,11 +60,26 @@ async def main():
     print(f"Scenario: {seed_story['description']}\n")
     
     # Run the game with the prepared character states (including memory)
-    final_state = await story_graph.run(
-        seed_story=seed_story,
-        character_profiles=story_manager.state.character_profiles,
-        character_memories=story_manager.state.character_memories
-    )
+    try:
+        final_state = await story_graph.run(
+            seed_story=seed_story,
+            character_profiles=story_manager.state.character_profiles,
+            character_memories=story_manager.state.character_memories
+        )
+    except BaseException as e:
+        await recorder.finish("aborted" if isinstance(e, KeyboardInterrupt) else "failed", error=str(e))
+        await db.close_db()
+        raise
+
+    from src.api import events_to_frontend_turns
+    speaker_keys = {c["name"]: c["key"] for c in scenario["characters"]}
+    turns = events_to_frontend_turns(final_state.get("events", []), seed_story, None, speaker_keys)["turns"]
+    conclusion = final_state.get("conclusion_reason") or ""
+    await recorder.finish("completed" if db.is_complete(turns, conclusion) else "incomplete", turns=turns,
+                          conclusion=conclusion, turn_count=len(turns),
+                          action_count=sum(1 for t in turns if t.get("actionText")))
+    if recorder.run_id:
+        print(f"Run #{recorder.run_id} saved to the database.")
     
     # Print results
     print("\n=== STORY TRANSCRIPT ===\n")
@@ -119,6 +143,7 @@ async def main():
     prompts_path = project_root / "prompts_log.json"
     prompts_path.write_text(json.dumps(all_logs, indent=2, default=str))
     print(f"Prompts saved to {prompts_path}")
+    await db.close_db()
 
 if __name__ == "__main__":
     asyncio.run(main())

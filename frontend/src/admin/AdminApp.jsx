@@ -1,9 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   BookOpen, Users, MessageSquareCode, SlidersHorizontal, Save, Plus, Trash2, LogOut,
-  Upload, Play, AlertTriangle, CheckCircle2, Loader2, X, Sparkles,
+  Upload, Play, AlertTriangle, CheckCircle2, Loader2, X, Sparkles, History, Download, FileUp, Library, Database,
 } from 'lucide-react';
 import { API_BASE, assetUrl, CHARACTER_COLORS } from '../lib/api';
+import { api, inputCls, downloadJson, formatDate, timeAgo } from './common';
+import RunsView from './RunsView';
 
 const TOKEN_KEY = 'narrative-admin-token';
 
@@ -68,28 +70,8 @@ function normalizeForSave(data) {
   };
 }
 
-async function api(path, { token, method = 'GET', body } = {}) {
-  const res = await fetch(`${API_BASE}${path}`, {
-    method,
-    headers: {
-      ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
-    },
-    body: body !== undefined ? JSON.stringify(body) : undefined,
-  });
-  let data = null;
-  try { data = await res.json(); } catch (_) {}
-  if (!res.ok) {
-    const err = new Error(data?.detail || `Request failed (${res.status})`);
-    err.status = res.status;
-    throw err;
-  }
-  return data;
-}
-
 // ───────────────────────────── small UI pieces ─────────────────────────────
 
-const inputCls = 'w-full bg-gray-900 border border-white/15 rounded-lg px-3 py-2 text-sm text-gray-100 placeholder:text-gray-500 focus:outline-none focus:border-amber-500/70';
 const labelCls = 'block text-xs font-semibold uppercase tracking-wide text-gray-400 mb-1.5';
 
 function Field({ label, help, children }) {
@@ -613,6 +595,65 @@ function GenerateDialog({ token, onClose, onCreated }) {
   );
 }
 
+// ───────────────────────────── history ─────────────────────────────
+
+function HistoryTab({ token, scenarioId, currentVersion, dirty, onRestored, onError }) {
+  const [versions, setVersions] = useState(null);
+  const [preview, setPreview] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    setVersions(null);
+    setPreview(null);
+    api(`/api/admin/scenarios/${scenarioId}/versions`, { token }).then((r) => setVersions(r.versions)).catch((e) => onError(e.message));
+  }, [token, scenarioId, currentVersion]);
+
+  const show = async (v) => {
+    try { setPreview(await api(`/api/admin/scenarios/${scenarioId}/versions/${v}`, { token }).then((d) => ({ ...d, _v: v }))); }
+    catch (e) { onError(e.message); }
+  };
+  const restore = async (v) => {
+    if (dirty && !window.confirm('You have unsaved changes. Restoring will discard them. Continue?')) return;
+    if (!window.confirm(`Restore version ${v}? It becomes a new version, so nothing is lost.`)) return;
+    setBusy(true);
+    try { onRestored(await api(`/api/admin/scenarios/${scenarioId}/versions/${v}/restore`, { token, method: 'POST' }), v); }
+    catch (e) { onError(e.message); } finally { setBusy(false); }
+  };
+
+  if (!versions) return <div className="flex items-center gap-2 text-gray-400"><Loader2 className="w-4 h-4 animate-spin" /> Loading history…</div>;
+  return (
+    <div className="grid lg:grid-cols-[320px_1fr] gap-6">
+      <div className="space-y-1.5">
+        <p className="text-xs text-gray-500 mb-2">Every save stores a full copy of the scenario. Restore any version at any time.</p>
+        {versions.map((v) => (
+          <div key={v.version} className={`rounded-xl border p-3 ${preview?._v === v.version ? 'bg-amber-500/10 border-amber-500/50' : 'bg-white/5 border-white/10'}`}>
+            <div className="flex items-center justify-between gap-2">
+              <span className="font-semibold text-gray-100">v{v.version} {v.version === currentVersion && <span className="text-xs font-normal text-emerald-300">(current)</span>}</span>
+              <span className="text-xs text-gray-500" title={formatDate(v.created_at)}>{timeAgo(v.created_at)}</span>
+            </div>
+            <div className="text-xs text-gray-400 mt-0.5">{v.note}</div>
+            <div className="flex gap-2 mt-2">
+              <button type="button" onClick={() => show(v.version)} className="px-2.5 py-1 rounded-lg bg-white/10 hover:bg-white/15 text-xs">View</button>
+              {v.version !== currentVersion && (
+                <button type="button" disabled={busy} onClick={() => restore(v.version)} className="px-2.5 py-1 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 text-xs disabled:opacity-40">Restore</button>
+              )}
+            </div>
+          </div>
+        ))}
+      </div>
+      <div className="min-w-0">
+        {preview ? (
+          <div className="space-y-3">
+            <h3 className="text-lg font-semibold text-gray-100">Version {preview._v}: {preview.title}</h3>
+            <p className="text-sm text-gray-400">{preview.status} · {preview.characters?.length} characters: {preview.characters?.map((c) => c.name).join(', ')}</p>
+            <pre className="text-xs bg-black/40 border border-white/10 rounded-lg p-3 max-h-[70vh] overflow-auto whitespace-pre-wrap text-gray-300">{JSON.stringify(preview, (k, v) => (k === '_v' ? undefined : v), 2)}</pre>
+          </div>
+        ) : <p className="text-sm text-gray-500">Select “View” to see a saved version.</p>}
+      </div>
+    </div>
+  );
+}
+
 // ───────────────────────────── main ─────────────────────────────
 
 const TABS = [
@@ -620,11 +661,13 @@ const TABS = [
   ['characters', 'Characters', Users],
   ['prompts', 'Prompts', MessageSquareCode],
   ['settings', 'Settings', SlidersHorizontal],
+  ['history', 'History', History],
 ];
 
 export default function AdminApp() {
   const [token, setToken] = useState(readToken);
   const [meta, setMeta] = useState(null);
+  const [view, setView] = useState('scenarios'); // 'scenarios' | 'stories'
   const [scenarios, setScenarios] = useState([]);
   const [scenarioId, setScenarioId] = useState(null);
   const [data, setData] = useState(null);
@@ -634,8 +677,10 @@ export default function AdminApp() {
   const [saving, setSaving] = useState(false);
   const [jsonError, setJsonError] = useState(false);
   const [showGenerate, setShowGenerate] = useState(false);
+  const importRef = useRef(null);
 
   const dirty = data !== null && JSON.stringify(data) !== savedJson;
+  const dbOnline = meta?.database !== false;
 
   const logout = () => { writeToken(''); setToken(''); };
   const handleError = (e) => {
@@ -693,16 +738,28 @@ export default function AdminApp() {
     setScenarioId(id);
   };
 
+  const applySaved = (res) => {
+    setData(res);
+    setSavedJson(JSON.stringify(res));
+  };
+
   const save = async () => {
     setSaving(true);
     setStatus(null);
     try {
-      const res = await api(`/api/admin/scenarios/${scenarioId}`, { token, method: 'PUT', body: normalizeForSave(data) });
-      setData(res);
-      setSavedJson(JSON.stringify(res));
+      applySaved(await api(`/api/admin/scenarios/${scenarioId}`, { token, method: 'PUT', body: normalizeForSave(data) }));
       await loadList();
-      setStatus({ type: 'ok', text: 'Saved. The next story run uses these changes.' });
+      setStatus({ type: 'ok', text: 'Saved to the database. The next story run uses these changes.' });
     } catch (e) { handleError(e); } finally { setSaving(false); }
+  };
+
+  const openScenario = async (id, message) => {
+    await loadList();
+    setData(null);
+    setScenarioId(id);
+    setTab('story');
+    setView('scenarios');
+    if (message) setStatus({ type: 'ok', text: message });
   };
 
   const createScenario = async () => {
@@ -713,27 +770,20 @@ export default function AdminApp() {
     if (!id) return setStatus({ type: 'error', text: 'Title needs at least one letter or number.' });
     try {
       await api('/api/admin/scenarios', { token, method: 'POST', body: { id, title, copy_from: scenarioId } });
-      await loadList();
-      setData(null);
-      setScenarioId(id);
-      setTab('story');
-      setStatus({ type: 'ok', text: `Created "${title}". Edit it and press Save.` });
+      await openScenario(id, `Created "${title}". Edit it and press Save.`);
     } catch (e) { handleError(e); }
   };
 
   const onGenerated = async (event) => {
     setShowGenerate(false);
-    await loadList();
-    setData(null);
-    setScenarioId(event.id);
-    setTab('story');
+    await openScenario(event.id);
     const extra = event.warnings?.length ? ` Note: ${event.warnings.join(' ')}` : '';
     setStatus({ type: event.warnings?.length ? 'error' : 'ok',
       text: `Draft “${event.title}” created. Review it, add images, set Status to Published and Save.${extra}` });
   };
 
   const deleteScenario = async () => {
-    if (!window.confirm(`Delete "${data?.title}" permanently? Its images are deleted too. This cannot be undone.`)) return;
+    if (!window.confirm(`Delete "${data?.title}" permanently? Its history and unused images are deleted too (its story runs are kept). This cannot be undone.`)) return;
     try {
       await api(`/api/admin/scenarios/${scenarioId}`, { token, method: 'DELETE' });
       const res = await loadList();
@@ -744,53 +794,103 @@ export default function AdminApp() {
     } catch (e) { handleError(e); }
   };
 
+  const exportScenario = async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/admin/scenarios/${scenarioId}/export`, { headers: { Authorization: `Bearer ${token}` } });
+      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || `Export failed (${res.status})`);
+      downloadJson(`${scenarioId}.scenario.json`, await res.text());
+    } catch (e) { handleError(e); }
+  };
+
+  const importScenario = async (file) => {
+    if (!file || !confirmDiscard()) return;
+    try {
+      const payload = JSON.parse(await file.text());
+      const res = await api('/api/admin/scenarios/import', { token, method: 'POST', body: payload });
+      await openScenario(res.id, `Imported “${res.title}” as a new scenario.`);
+    } catch (e) { handleError(e instanceof SyntaxError ? new Error('That file is not valid JSON.') : e); }
+  };
+
   const update = (fn) => setData((d) => fn(d));
   const isDefault = scenarioId === 'rickshaw_accident';
+  const btn = 'inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm';
 
   return (
     <div className="min-h-screen bg-gray-950 text-gray-100">
       {showGenerate && <GenerateDialog token={token} onClose={() => setShowGenerate(false)} onCreated={onGenerated} />}
+      <input ref={importRef} type="file" accept=".json,application/json" className="hidden"
+        onChange={(e) => { importScenario(e.target.files?.[0]); e.target.value = ''; }} />
       <header className="sticky top-0 z-20 bg-gray-950/95 backdrop-blur border-b border-white/10">
         <div className="px-4 md:px-6 py-3 flex flex-wrap items-center gap-3">
-          <span className="text-lg font-bold text-amber-300 mr-2">Narrative Admin</span>
-          <label htmlFor="admin-scenario" className="sr-only">Scenario</label>
-          <select id="admin-scenario" value={scenarioId ?? ''} onChange={(e) => switchScenario(e.target.value)}
-            className="bg-gray-900 border border-white/15 rounded-lg px-3 py-1.5 text-sm min-w-48">
-            {scenarios.map((s) => <option key={s.id} value={s.id}>{s.title}{s.status === 'draft' ? ' (draft)' : ''}</option>)}
-          </select>
-          <button type="button" onClick={createScenario} className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-white/10 hover:bg-white/15 text-sm">
-            <Plus className="w-4 h-4" /> New
-          </button>
-          <button type="button" onClick={() => confirmDiscard() && setShowGenerate(true)}
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 text-sm">
-            <Sparkles className="w-4 h-4" /> New with AI
-          </button>
-          <button type="button" onClick={deleteScenario} disabled={isDefault || !data} title={isDefault ? 'The default scenario cannot be deleted' : 'Delete scenario'}
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm text-red-300 hover:bg-red-500/10 disabled:opacity-30 disabled:cursor-not-allowed">
-            <Trash2 className="w-4 h-4" /> Delete
-          </button>
+          <span className="text-lg font-bold text-amber-300 mr-1">Narrative Admin</span>
+          <div className="flex rounded-lg bg-white/5 p-0.5" role="tablist" aria-label="Section">
+            {[['scenarios', 'Scenarios', BookOpen], ['stories', 'Stories', Library]].map(([key, label, Icon]) => (
+              <button key={key} type="button" role="tab" aria-selected={view === key}
+                onClick={() => { if (key === view) return; if (key === 'stories' || confirmDiscard()) setView(key); }}
+                className={`${btn} ${view === key ? 'bg-amber-500/20 text-amber-300' : 'text-gray-400 hover:text-gray-200'}`}>
+                <Icon className="w-4 h-4" /> {label}
+              </button>
+            ))}
+          </div>
+
+          {view === 'scenarios' && (
+            <>
+              <label htmlFor="admin-scenario" className="sr-only">Scenario</label>
+              <select id="admin-scenario" value={scenarioId ?? ''} onChange={(e) => switchScenario(e.target.value)}
+                className="bg-gray-900 border border-white/15 rounded-lg px-3 py-1.5 text-sm min-w-48">
+                {scenarios.map((s) => <option key={s.id} value={s.id}>{s.title}{s.status === 'draft' ? ' (draft)' : ''}</option>)}
+              </select>
+              {data?.version && <span className="text-xs text-gray-500" title={data.updated_at ? `Last saved ${formatDate(data.updated_at)}` : ''}>v{data.version}</span>}
+              <button type="button" onClick={createScenario} disabled={!dbOnline} className={`${btn} bg-white/10 hover:bg-white/15 disabled:opacity-30`}>
+                <Plus className="w-4 h-4" /> New
+              </button>
+              <button type="button" onClick={() => confirmDiscard() && setShowGenerate(true)} disabled={!dbOnline}
+                className={`${btn} bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 disabled:opacity-30`}>
+                <Sparkles className="w-4 h-4" /> New with AI
+              </button>
+              <button type="button" onClick={exportScenario} disabled={!data || !dbOnline} title="Export: download this scenario with its images" aria-label="Export scenario"
+                className={`${btn} text-gray-300 hover:bg-white/10 disabled:opacity-30`}><Download className="w-4 h-4" /> <span className="hidden 2xl:inline">Export</span></button>
+              <button type="button" onClick={() => importRef.current?.click()} disabled={!dbOnline} title="Import a scenario file as a new scenario" aria-label="Import scenario"
+                className={`${btn} text-gray-300 hover:bg-white/10 disabled:opacity-30`}><FileUp className="w-4 h-4" /> <span className="hidden 2xl:inline">Import</span></button>
+              <button type="button" onClick={deleteScenario} disabled={isDefault || !data || !dbOnline} title={isDefault ? 'The default scenario cannot be deleted' : 'Delete scenario'} aria-label="Delete scenario"
+                className={`${btn} text-red-300 hover:bg-red-500/10 disabled:opacity-30 disabled:cursor-not-allowed`}>
+                <Trash2 className="w-4 h-4" /> <span className="hidden 2xl:inline">Delete</span>
+              </button>
+            </>
+          )}
           <div className="flex-1" />
           <a href="/" onClick={(e) => { if (!confirmDiscard()) e.preventDefault(); }}
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm text-gray-300! hover:bg-white/10">
+            className={`${btn} text-gray-300! hover:bg-white/10`}>
             <Play className="w-4 h-4" /> Open player
           </a>
-          <button type="button" onClick={save} disabled={!dirty || saving || jsonError}
-            className="inline-flex items-center gap-1.5 px-4 py-1.5 rounded-lg bg-linear-to-r from-amber-600 to-orange-600 text-white text-sm font-semibold disabled:opacity-40">
-            {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
-            {dirty ? 'Save changes' : 'Saved'}
-          </button>
+          {view === 'scenarios' && (
+            <button type="button" onClick={save} disabled={!dirty || saving || jsonError || !dbOnline}
+              className="inline-flex items-center gap-1.5 px-4 py-1.5 rounded-lg bg-linear-to-r from-amber-600 to-orange-600 text-white text-sm font-semibold disabled:opacity-40">
+              {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
+              {dirty ? 'Save changes' : 'Saved'}
+            </button>
+          )}
           <button type="button" onClick={() => confirmDiscard() && logout()} aria-label="Log out" title="Log out"
             className="p-2 rounded-lg text-gray-400 hover:text-gray-200 hover:bg-white/10"><LogOut className="w-4 h-4" /></button>
         </div>
-        <nav className="px-4 md:px-6 flex gap-1 overflow-x-auto [scrollbar-width:none]">
-          {TABS.map(([key, label, Icon]) => (
-            <button key={key} type="button" onClick={() => setTab(key)}
-              className={`inline-flex items-center gap-1.5 px-4 py-2.5 text-sm border-b-2 -mb-px whitespace-nowrap ${tab === key ? 'border-amber-500 text-amber-300' : 'border-transparent text-gray-400 hover:text-gray-200'}`}>
-              <Icon className="w-4 h-4" /> {label}
-            </button>
-          ))}
-        </nav>
+        {view === 'scenarios' && (
+          <nav className="px-4 md:px-6 flex gap-1 overflow-x-auto [scrollbar-width:none]">
+            {TABS.map(([key, label, Icon]) => (
+              <button key={key} type="button" onClick={() => setTab(key)}
+                className={`inline-flex items-center gap-1.5 px-4 py-2.5 text-sm border-b-2 -mb-px whitespace-nowrap ${tab === key ? 'border-amber-500 text-amber-300' : 'border-transparent text-gray-400 hover:text-gray-200'}`}>
+                <Icon className="w-4 h-4" /> {label}
+              </button>
+            ))}
+          </nav>
+        )}
       </header>
+
+      {!dbOnline && (
+        <div className="mx-4 md:mx-6 mt-4 flex items-start gap-2 rounded-lg p-3 text-sm bg-amber-500/10 border border-amber-500/30 text-amber-200">
+          <Database className="w-4 h-4 mt-0.5 shrink-0" />
+          <span>The database is not connected, so the panel is <b>read-only</b>: scenarios come from the backup files and nothing can be saved. Story runs aren't recorded. Check <code>DATABASE_URL</code> and restart the API.</span>
+        </div>
+      )}
 
       {status && (
         <div className={`mx-4 md:mx-6 mt-4 flex items-start gap-2 rounded-lg p-3 text-sm ${status.type === 'ok' ? 'bg-emerald-500/10 border border-emerald-500/30 text-emerald-300' : 'bg-red-500/10 border border-red-500/30 text-red-300'}`}>
@@ -801,7 +901,11 @@ export default function AdminApp() {
       )}
 
       <main className="px-4 md:px-6 py-6">
-        {!data ? (
+        {view === 'stories' ? (
+          dbOnline
+            ? <RunsView token={token} scenarios={scenarios} onError={(msg) => setStatus({ type: 'error', text: msg })} />
+            : <p className="text-sm text-gray-500">Story runs are stored in the database, which is not connected.</p>
+        ) : !data ? (
           <div className="flex items-center gap-2 text-gray-400"><Loader2 className="w-4 h-4 animate-spin" /> Loading…</div>
         ) : (
           <div key={scenarioId}>
@@ -809,6 +913,11 @@ export default function AdminApp() {
             {tab === 'characters' && <CharactersTab data={data} update={update} meta={meta} imageProps={imageProps} />}
             {tab === 'prompts' && <PromptsTab data={data} update={update} meta={meta} />}
             {tab === 'settings' && <SettingsTab data={data} update={update} meta={meta} />}
+            {tab === 'history' && (dbOnline
+              ? <HistoryTab token={token} scenarioId={scenarioId} currentVersion={data.version} dirty={dirty}
+                  onError={(msg) => setStatus({ type: 'error', text: msg })}
+                  onRestored={(res, v) => { applySaved(res); loadList(); setStatus({ type: 'ok', text: `Restored version ${v} (saved as v${res.version}).` }); }} />
+              : <p className="text-sm text-gray-500">History is stored in the database, which is not connected.</p>)}
           </div>
         )}
       </main>

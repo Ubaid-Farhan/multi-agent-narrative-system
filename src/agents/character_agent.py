@@ -9,6 +9,7 @@ from ..prompts.character_prompts import get_character_prompt
 class CharacterAgent(BaseAgent):
     def __init__(self, name: str, config: StoryConfig):
         super().__init__(name, config)
+        self.last_meta: Dict = {}  # reasoning / decision of the last response (saved with the run)
 
     async def respond(self, story_state: StoryState, context: str,
                       world_state_text: str = "") -> Tuple[str, Optional[Dict]]:
@@ -20,6 +21,7 @@ class CharacterAgent(BaseAgent):
             action dict has keys: type, target, description
         """
         character_profile = story_state.character_profiles.get(self.name)
+        self.last_meta = {}
 
         prompt = get_character_prompt(
             character_name=self.name,
@@ -29,10 +31,10 @@ class CharacterAgent(BaseAgent):
             world_state_text=world_state_text
         )
 
-        try:
-            content = await self.generate_response(prompt)
-            content = content.strip()
+        # LLMUnavailableError is not caught here: the story stops cleanly if no model can answer.
+        content = (await self.generate_response(prompt)).strip()
 
+        try:
             # Try to parse structured JSON response
             cleaned = self._clean_json_response(content)
             data = json.loads(cleaned)
@@ -40,6 +42,7 @@ class CharacterAgent(BaseAgent):
             dialogue = data.get("dialogue") or ""
             action = data.get("action")
             decision = data.get("decision", "talk")
+            self.last_meta = {"reasoning": data.get("reasoning"), "decision": decision, "parsed": True}
 
             # Validate action structure if present
             if action and isinstance(action, dict):
@@ -59,11 +62,13 @@ class CharacterAgent(BaseAgent):
             return dialogue, action
 
         except (json.JSONDecodeError, Exception) as e:
-            # Fallback: treat the whole response as dialogue (no action)
-            print(f"Warning: {self.name} response was not valid JSON, treating as dialogue. Error: {e}")
-            # Try to extract useful text from the response
-            fallback_text = content if content else "..."
-            # Strip any partial JSON artifacts
-            if fallback_text.startswith("{"):
-                fallback_text = "..."
-            return fallback_text, None
+            # Usually a cut-off answer: recover the dialogue from the partial JSON instead of showing raw JSON
+            salvaged = self._salvage_fields(content, ["dialogue", "reasoning", "decision"])
+            print(f"Warning: {self.name} response was not valid JSON ({e}); "
+                  f"{'recovered the dialogue' if salvaged.get('dialogue') else 'no dialogue recovered'}.")
+            self.last_meta = {"parsed": False, "parse_error": str(e), "salvaged": bool(salvaged.get("dialogue")),
+                              "reasoning": salvaged.get("reasoning"), "decision": salvaged.get("decision")}
+            if salvaged.get("dialogue"):
+                return salvaged["dialogue"], None
+            looks_like_json = content.lstrip().startswith(("{", "```", "[")) or '"dialogue"' in content
+            return (content if content and not looks_like_json else "..."), None

@@ -1,18 +1,112 @@
 import { useState, useEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { ChevronLeft, ChevronRight, Play, RotateCcw, Volume2, Square, Settings } from 'lucide-react';
+import { ChevronLeft, ChevronRight, Play, RotateCcw, Volume2, Square, Settings, History, Home as HomeIcon, X, Loader2, StepForward } from 'lucide-react';
 import { Button } from './components/button';
 import { API_BASE, assetUrl, colorsFor } from './lib/api';
 import './App.css';
 
 // Character picture, or a coloured initial when no image has been added yet (e.g. AI-generated scenarios).
 function CharacterPicture({ image, name, color, className, large = false }) {
-  if (image) return <img src={assetUrl(image)} alt={name} className={className} />;
+  // Falls back to initials if the image can't load (e.g. the database is offline).
+  const [failedSrc, setFailedSrc] = useState(null);
+  if (image && failedSrc !== image) return <img src={assetUrl(image)} alt={name} className={className} onError={() => setFailedSrc(image)} />;
   const initials = (name || '?').split(/\s+/).filter(Boolean).slice(0, 2).map((w) => w[0]).join('').toUpperCase();
   return (
     <div role="img" aria-label={name}
       className={`${large ? 'w-32 h-32 md:w-44 md:h-44 text-4xl md:text-5xl' : 'w-full h-full text-lg'} rounded-full bg-linear-to-br ${colorsFor(color).bg} text-white font-bold flex items-center justify-center shadow-2xl`}>
       {initials}
+    </div>
+  );
+}
+
+function formatDate(iso) {
+  if (!iso) return '';
+  try {
+    return new Date(iso).toLocaleString(undefined, { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+  } catch (_) { return ''; }
+}
+
+// Saved runs: play any of them again, or continue an unfinished one.
+function StoryLibrary({ scenarioId, scenarios, version, onPlay, onContinue, onClose }) {
+  const [scope, setScope] = useState('scenario');
+  const [runs, setRuns] = useState(null);
+  const [error, setError] = useState('');
+  const titles = Object.fromEntries(scenarios.map((sc) => [sc.id, sc.title]));
+
+  useEffect(() => {
+    const controller = new AbortController();
+    const q = scope === 'scenario' && scenarioId ? `scenario=${encodeURIComponent(scenarioId)}&` : '';
+    fetch(`${API_BASE}/api/runs?${q}limit=100`, { signal: controller.signal })
+      .then((res) => (res.ok ? res.json() : Promise.reject()))
+      .then((data) => { setError(''); setRuns(data.runs ?? []); })
+      .catch((e) => { if (e?.name !== 'AbortError') setError('Saved stories could not be loaded.'); });
+    return () => controller.abort();
+  }, [scope, scenarioId, version]);
+
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === 'Escape') onClose(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  return (
+    <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4" role="dialog" aria-modal="true" aria-labelledby="library-title">
+      <div className="w-full max-w-3xl max-h-[85vh] flex flex-col bg-gray-900 border border-white/10 rounded-2xl shadow-2xl">
+        <div className="flex items-center gap-3 p-5 border-b border-white/10">
+          <History className="w-5 h-5 text-amber-300" />
+          <h2 id="library-title" className="text-xl font-bold text-amber-300 flex-1">Purani stories</h2>
+          <div className="flex rounded-lg overflow-hidden border border-white/15 text-xs">
+            {[['scenario', 'Is kahani ki'], ['all', 'Sab']].map(([key, label]) => (
+              <button key={key} type="button" onClick={() => { if (key !== scope) { setRuns(null); setScope(key); } }}
+                className={`px-3 py-1.5 ${scope === key ? 'bg-amber-500 text-black font-semibold' : 'bg-white/5 text-gray-300 hover:bg-white/10'}`}>
+                {label}
+              </button>
+            ))}
+          </div>
+          <button type="button" onClick={onClose} aria-label="Close" className="p-1.5 rounded-lg text-gray-400 hover:text-white hover:bg-white/10">
+            <X className="w-5 h-5" />
+          </button>
+        </div>
+
+        <div className="overflow-y-auto p-3 space-y-2">
+          {error && <p className="p-4 text-sm text-red-400">{error}</p>}
+          {!error && runs === null && (
+            <p className="p-4 text-sm text-gray-400 flex items-center gap-2"><Loader2 className="w-4 h-4 animate-spin" /> Loading…</p>
+          )}
+          {runs?.length === 0 && (
+            <p className="p-6 text-center text-gray-400">Abhi koi saved story nahi. Nayi story chalayein — har run yahan save hota hai.</p>
+          )}
+          {runs?.map((run) => (
+            <div key={run.id} className="flex flex-wrap items-center gap-3 rounded-xl bg-white/5 border border-white/10 p-3">
+              <div className="flex-1 min-w-52">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-gray-100 font-medium">{titles[run.scenario_id] ?? run.title}</span>
+                  <span className="text-xs text-gray-500">Run #{run.id}</span>
+                </div>
+                <div className="mt-1 flex flex-wrap items-center gap-2 text-xs">
+                  <span className={`px-2 py-0.5 rounded-full ${run.complete ? 'bg-emerald-500/15 text-emerald-300' : 'bg-amber-500/15 text-amber-300'}`}>
+                    {run.complete ? 'Poori' : 'Adhoori'} · {run.turn_count} turns
+                  </span>
+                  <span className="text-gray-400">{run.language === 'english' ? 'English' : 'Roman Urdu'}</span>
+                  <span className="text-gray-500">{formatDate(run.started_at)}</span>
+                </div>
+              </div>
+              <div className="flex gap-2">
+                <button type="button" onClick={() => onPlay(run)}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-white/10 hover:bg-white/20 text-sm text-gray-100">
+                  <Play className="w-4 h-4" /> Play
+                </button>
+                {run.can_continue && (
+                  <button type="button" onClick={() => onContinue(run)}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-amber-500 hover:bg-amber-400 text-sm text-black font-semibold">
+                    <StepForward className="w-4 h-4" /> Continue
+                  </button>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
     </div>
   );
 }
@@ -55,12 +149,16 @@ export default function Home() {
   const [displayedText, setDisplayedText] = useState('');
   const [isTyping, setIsTyping] = useState(false);
   const typingTimerRef = useRef(null);
+  const dialogueBodyRef = useRef(null);
   const audioRef = useRef(null);
   const isAutoPlayingRef = useRef(false);
 
   const [scenarios, setScenarios] = useState([]);
   const [scenarioId, setScenarioId] = useState(null);
   const [scenarioInfo, setScenarioInfo] = useState(null);
+  const [continuable, setContinuable] = useState(null);   // newest unfinished run of this scenario
+  const [showLibrary, setShowLibrary] = useState(false);
+  const [libraryVersion, setLibraryVersion] = useState(0); // bump to refresh saved-run lists
 
   const totalTurns = storyData?.turns?.length ?? 0;
 
@@ -76,11 +174,8 @@ export default function Home() {
         const res = await fetch(`${API_BASE}/api/story`, { signal: controller.signal });
         if (res.ok) {
           const data = await res.json();
-          if (data?.turns?.length) {
-            setStoryData(data);
-            setCurrentTurn(-1);
-            lastScenario = data.scenarioId ?? null;
-          }
+          // Open on the menu (Continue / New / Saved stories); only remember which scenario was last used.
+          if (data?.turns?.length) lastScenario = data.scenarioId ?? null;
         }
       } catch (_) {}
       try {
@@ -104,6 +199,16 @@ export default function Home() {
       .catch(() => {});
     return () => controller.abort();
   }, [scenarioId]);
+
+  useEffect(() => {
+    if (!scenarioId) return;
+    const controller = new AbortController();
+    fetch(`${API_BASE}/api/runs?scenario=${encodeURIComponent(scenarioId)}&continuable=true&limit=1`, { signal: controller.signal })
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => setContinuable(data?.runs?.[0] ?? null))
+      .catch(() => {});
+    return () => controller.abort();
+  }, [scenarioId, libraryVersion]);
 
   useEffect(() => {
     if (currentTurn >= 0) {
@@ -150,6 +255,12 @@ export default function Home() {
     return () => clearTimeout(typingTimerRef.current);
   }, [showDialogue, currentTurn]);
 
+  // Keep the newest typed line in view when a long dialogue scrolls inside the bubble
+  useEffect(() => {
+    const el = dialogueBodyRef.current;
+    if (el && isTyping) el.scrollTop = el.scrollHeight;
+  }, [displayedText, isTyping]);
+
   const skipTyping = () => {
     if (isTyping && currentData?.dialogue) {
       clearTimeout(typingTimerRef.current);
@@ -158,42 +269,92 @@ export default function Home() {
     }
   };
 
-  const startStory = () => {
+  const openStream = (url) => {
     setIsLoading(true);
     setRunError(null);
-    const url = `${API_BASE}/api/run/stream?lang=${language}&scenario=${encodeURIComponent(scenarioId ?? "")}`;
+    setStoryData(null);
+    setCurrentTurn(-1);
     const es = new EventSource(url);
     let story = { title: null, scenario: null, turns: [], conclusion: "" };
+    let resumed = false;
+    let jumped = false;
     es.onmessage = (ev) => {
       try {
         const data = JSON.parse(ev.data);
         if (data.type === "meta") {
-          story = { title: data.title, scenario: data.scenario, turns: [], conclusion: "" };
+          resumed = Boolean(data.resumed);
+          story = { title: data.title, scenario: data.scenario, turns: [], conclusion: "", runId: data.runId };
           setStoryData({ ...story });
         } else if (data.type === "turns" && Array.isArray(data.newTurns)) {
           const prevLen = story.turns.length;
           story.turns = [...story.turns, ...data.newTurns];
           setStoryData({ ...story });
-          setCurrentTurn((prev) => (prev === prevLen - 1 && prev >= 0 ? story.turns.length - 1 : prev));
+          if (resumed && !jumped) {
+            // Continuing: jump to the last saved turn; new turns follow from there.
+            jumped = true;
+            setCurrentTurn(story.turns.length - 1);
+          } else {
+            setCurrentTurn((prev) => (prev === prevLen - 1 && prev >= 0 ? story.turns.length - 1 : prev));
+          }
         } else if (data.type === "conclusion") {
           story.conclusion = data.conclusion ?? "";
           setStoryData({ ...story });
         } else if (data.type === "done") {
           es.close();
-          setCurrentTurn(-1);
+          if (!resumed) setCurrentTurn(-1);
           setIsLoading(false);
+          setLibraryVersion((v) => v + 1);
         } else if (data.type === "error") {
           es.close();
           setIsLoading(false);
           setRunError(data.message || "Story could not be started. Please try again.");
+          setLibraryVersion((v) => v + 1);
         }
       } catch (_) {}
     };
     es.onerror = () => {
       es.close();
       setIsLoading(false);
-      setRunError("Connection lost or server error. Please try again.");
+      setRunError("Connection lost or server error. Your progress up to the last turn is saved — use Continue.");
+      setLibraryVersion((v) => v + 1);
     };
+  };
+
+  const startStory = () => {
+    openStream(`${API_BASE}/api/run/stream?lang=${language}&scenario=${encodeURIComponent(scenarioId ?? "")}`);
+  };
+
+  const continueRun = (run) => {
+    setShowLibrary(false);
+    if (run.scenario_id !== scenarioId) setScenarioId(run.scenario_id);
+    setLanguage(run.language);
+    openStream(`${API_BASE}/api/run/stream?continue_run=${run.id}`);
+  };
+
+  const playRun = async (run) => {
+    setRunError(null);
+    try {
+      const res = await fetch(`${API_BASE}/api/runs/${run.id}`);
+      if (!res.ok) throw new Error();
+      const data = await res.json();
+      setShowLibrary(false);
+      if (data.scenario_id !== scenarioId) setScenarioId(data.scenario_id);
+      setStoryData({ title: data.title, scenario: data.scenario, turns: data.turns, conclusion: data.conclusion, runId: data.id });
+      setShowDialogue(false);
+      setCurrentTurn(-1);
+    } catch (_) {
+      setRunError(`Run #${run.id} could not be loaded.`);
+    }
+  };
+
+  const backToMenu = () => {
+    stopAudio();
+    isAutoPlayingRef.current = false;
+    setIsAutoPlaying(false);
+    setShowDialogue(false);
+    setCurrentTurn(-1);
+    setStoryData(null);
+    setLibraryVersion((v) => v + 1);
   };
 
   const goNext = () => {
@@ -285,6 +446,10 @@ export default function Home() {
 
   return (
     <div className="min-h-screen bg-black flex flex-col">
+      {showLibrary && (
+        <StoryLibrary scenarioId={scenarioId} scenarios={scenarios} version={libraryVersion}
+          onPlay={playRun} onContinue={continueRun} onClose={() => setShowLibrary(false)} />
+      )}
 
       {/* ── Full-bleed scene ── */}
       <div className="relative overflow-hidden flex-1" style={{ minHeight: 'calc(100vh - 260px)' }}>
@@ -315,9 +480,25 @@ export default function Home() {
               className="absolute inset-0 flex items-center justify-center p-6 z-20"
             >
               <div className="bg-black/60 backdrop-blur-md rounded-2xl p-8 max-w-2xl w-full shadow-2xl border border-white/10">
-                <h2 className="text-3xl font-bold text-amber-300 mb-4">Start Story</h2>
-                <p className="text-gray-200 text-lg leading-relaxed mb-4">
-                  Run the full narrative once. This may take a few minutes.
+                <h2 className="text-3xl font-bold text-amber-300 mb-4">Kahani shuru karein</h2>
+
+                {continuable && !isLoading && (
+                  <div className="mb-6 rounded-xl border border-amber-500/40 bg-amber-500/10 p-4 flex flex-wrap items-center gap-3">
+                    <div className="flex-1 min-w-48">
+                      <p className="text-amber-300 font-semibold">Adhoori kahani mili</p>
+                      <p className="text-gray-300 text-sm">
+                        Run #{continuable.id} · {continuable.turn_count} turns · {continuable.language === 'english' ? 'English' : 'Roman Urdu'} · {formatDate(continuable.started_at)}
+                      </p>
+                    </div>
+                    <Button onClick={() => continueRun(continuable)}
+                      className="bg-amber-500 hover:bg-amber-400 text-black font-semibold px-5 py-2.5">
+                      <StepForward className="w-4 h-4 mr-1.5" /> Continue
+                    </Button>
+                  </div>
+                )}
+
+                <p className="text-gray-200 leading-relaxed mb-4">
+                  Nayi kahani: AI har dafa naye sire se likhta hai. Is mein kuch minute lag sakte hain.
                 </p>
 
                 {/* Scenario picker */}
@@ -371,7 +552,14 @@ export default function Home() {
                     disabled={isLoading}
                     className="bg-linear-to-r from-amber-600 to-orange-600 hover:from-amber-700 hover:to-orange-700 text-white px-8 py-3 text-lg disabled:opacity-60"
                   >
-                    {isLoading ? "Running story..." : "Start story"}
+                    {isLoading ? "Running story..." : "New story"}
+                  </Button>
+                  <Button
+                    onClick={() => setShowLibrary(true)}
+                    disabled={isLoading}
+                    className="bg-white/10 hover:bg-white/20 text-gray-100 px-6 py-3 text-lg disabled:opacity-60"
+                  >
+                    <History className="w-5 h-5 mr-2" /> Purani stories
                   </Button>
                 </div>
                 <a href="/admin" className="mt-6 flex items-center justify-center gap-1.5 text-xs text-gray-400! hover:text-amber-300!">
@@ -432,7 +620,7 @@ export default function Home() {
               animate={{ opacity: 1, x: 0 }}
               exit={{ opacity: 0, x: 50 }}
               transition={{ duration: 0.5 }}
-              className="absolute bottom-0 left-0 right-0 flex items-end justify-between p-4 md:p-8 z-10"
+              className="absolute top-20 md:top-24 bottom-0 left-0 right-0 flex items-end justify-between p-4 md:p-8 z-10"
             >
               {/* Phase 3-C: character nameplate moved below image */}
               <motion.div
@@ -460,16 +648,17 @@ export default function Home() {
                     animate={{ opacity: 1, scale: 1, y: 0 }}
                     exit={{ opacity: 0, scale: 0.8 }}
                     transition={{ duration: 0.4 }}
-                    className="flex-1 ml-4 md:ml-8 mb-8"
+                    className="flex-1 self-stretch min-h-0 flex flex-col justify-end ml-4 md:ml-8 mb-8"
                   >
                     {/* Phase 2-A: palette bubble + Phase 3-A: typewriter */}
+                    {/* max-h-full + scrolling body: long lines must not grow over the title */}
                     <div
-                      className="relative max-w-xl rounded-2xl overflow-hidden shadow-2xl"
+                      className="relative max-w-xl max-h-full flex flex-col rounded-2xl overflow-hidden shadow-2xl"
                       onClick={skipTyping}
                       style={{ cursor: isTyping ? 'pointer' : 'default' }}
                     >
                       {/* Character name header */}
-                      <div className={`px-4 py-2 bg-linear-to-r ${colorsOf(currentData.character).bg} flex items-center justify-between`}>
+                      <div className={`shrink-0 px-4 py-2 bg-linear-to-r ${colorsOf(currentData.character).bg} flex items-center justify-between`}>
                         <span className="text-white text-xs font-bold uppercase tracking-wider drop-shadow">
                           {currentData.speaker}
                         </span>
@@ -491,7 +680,10 @@ export default function Home() {
                         </button>
                       </div>
                       {/* Dialogue body */}
-                      <div className={`${colorsOf(currentData.character).bubble} border-2 border-t-0 rounded-b-2xl p-4 md:p-5`}>
+                      <div
+                        ref={dialogueBodyRef}
+                        className={`${colorsOf(currentData.character).bubble} border-2 border-t-0 rounded-b-2xl p-4 md:p-5 min-h-0 overflow-y-auto`}
+                      >
                         <p className={`text-sm md:text-base leading-relaxed ${colorsOf(currentData.character).text} min-h-[2em]`}>
                           {displayedText.split('\n').map((line, i, arr) => (
                             <span key={i}>
@@ -549,6 +741,13 @@ export default function Home() {
                     >
                       <RotateCcw className="w-5 h-5 mr-2" />
                       Watch Again
+                    </Button>
+                    <Button
+                      onClick={backToMenu}
+                      className="ml-3 bg-white/10 hover:bg-white/20 text-white px-8 py-3"
+                    >
+                      <HomeIcon className="w-5 h-5 mr-2" />
+                      Menu
                     </Button>
                   </div>
                 </div>
@@ -652,9 +851,17 @@ export default function Home() {
             )}
             <button
               onClick={restart}
+              aria-label="Restart" title="Restart"
               className="p-1.5 rounded-lg text-white/50 hover:text-white hover:bg-white/10 transition-colors"
             >
               <RotateCcw className="w-4 h-4" />
+            </button>
+            <button
+              onClick={backToMenu}
+              aria-label="Menu" title="Menu (Continue / New / Purani stories)"
+              className="p-1.5 rounded-lg text-white/50 hover:text-white hover:bg-white/10 transition-colors"
+            >
+              <HomeIcon className="w-4 h-4" />
             </button>
           </div>
 

@@ -1,354 +1,497 @@
-# GenAI_DSS: Multi-Agent Narrative System
+# Multi-Agent Narrative System
 
-## 1. Introduction
+**AI characters that argue, bargain, cry, bribe and improvise their way through a live street scene. Every run is a new story.**
 
-A **Multi-Agent Narrative System** built for the **Hackfest x Datathon 2026** Generative AI module. The system uses **LangGraph** to orchestrate autonomous character agents that navigate a conflict-driven story defined by a "Story Seed."
+You describe a situation, for example *a rickshaw hits a BMW on Shahrah-e-Faisal, Karachi*. A cast of autonomous LLM agents plays it out turn by turn. Each agent has its own psychology, memory, goals and inventory. A **Director** agent narrates the scene and decides who speaks next, a **Reviewer** agent rejects lines that don't sound real, and the scene streams live to a web player with a different voice for each character.
 
-Unlike traditional chatbots, these agents possess:
-- **Individual Memory** — each character tracks what they've seen, heard, and done across turns.
-- **Open-Ended Physical Actions** — agents perform any realistic action (not from a fixed menu) that changes the world state.
-- **Deep Psychological Personas** — each character has a complete psychology, background, fears, strategies, and tactical evolution that guides their behavior across turns.
-- **Structured Reasoning** — agents "think" through their goals before deciding whether to talk, act, or both.
-- **LLM-Generated Story Twists** — the Director agent generates context-aware dramatic complications mid-story, unique every run.
-- **Reviewer Agent** — a fifth agent checks each character turn for Karachi realism, logical consistency, and repetition; rejected turns get one retry with the reviewer's suggestion.
-- **Real-Time Frontend** — React frontend with SSE streaming shows turns as they are generated.
+Everything the agents see (story, characters, personas, prompts, settings, images) is stored in **Postgres** and edited in an **admin panel**, with full version history. An AI can write a whole new scenario from a single sentence. **Every story run is recorded step by step**: each narration, dialogue with the character's hidden reasoning, reviewer verdict, action, world state and LLM prompt. Completed runs are replayed when the LLM is down.
 
-## 2. Setup
+---
+
+## Table of contents
+1. [Highlights](#1-highlights)
+2. [How a story runs](#2-how-a-story-runs)
+3. [Quick start](#3-quick-start)
+4. [The story player](#4-the-story-player)
+5. [The admin panel](#5-the-admin-panel)
+6. [New scenario with AI](#6-new-scenario-with-ai)
+7. [Database, run records & offline replay](#7-database-run-records--offline-replay)
+8. [LLM models & resilience](#8-llm-models--resilience)
+9. [The story engine in depth](#9-the-story-engine-in-depth)
+10. [Configuration reference](#10-configuration-reference)
+11. [Scenario file format](#11-scenario-file-format)
+12. [API reference](#12-api-reference)
+13. [Project structure](#13-project-structure)
+14. [Deployment](#14-deployment)
+15. [Troubleshooting](#15-troubleshooting)
+
+---
+
+## 1. Highlights
+
+| | Feature | What it means |
+|---|---|---|
+| 🎭 | **Autonomous character agents** | Each character has a multi-paragraph persona (psychology, language register, tactics that change over the scene, a comic flaw, forms of address, hard "never do" rules), plus goals, inventory and a personal memory. |
+| 🎬 | **Director agent** | Picks who speaks next, narrates the scene with fresh sensory detail each turn, follows a 4-phase story arc, and decides when the story has earned its ending. |
+| 🌀 | **AI-generated twists** | At a set turn the Director invents a context-aware complication from what has happened so far, so every run gets a different twist. |
+| 🧐 | **Reviewer agent** | Checks every turn for realism, language register, logic and repetition. A rejected turn is regenerated once with the Reviewer's feedback. |
+| ✋ | **Open-ended actions** | Characters can do *anything* physical (grab keys, sit on the road, throw money, call a lawyer), and actions update a shared world state. |
+| 🔴 | **Live streaming player** | Turns stream in over Server-Sent Events, with typewriter dialogue, per-character TTS voices, auto-play, Roman Urdu / English modes and a scenario picker. |
+| 🛠️ | **Admin panel** | Edit every story, character, persona and prompt from the browser. Placeholders are validated before saving, images are uploaded to the database, every save is versioned, and scenarios can be exported and imported. |
+| ✨ | **New with AI** | Turn a one-line idea into a complete, production-ready scenario (characters, deep personas and every prompt), using your own **gpt-oss** server. |
+| 💾 | **Everything in Postgres (Neon)** | Scenarios, characters, prompts, images and version history live in the database. JSON files in `scenarios/` are kept in sync as a backup. |
+| 📜 | **Every run recorded** | Each run gets a run number and a full timeline in admin → **Stories**: narration, twist, dialogue + reasoning, rejected drafts, reviewer verdicts, actions, world state, ending, and every LLM prompt/response. |
+| ♻️ | **Offline replay** | If the API key fails or the quota runs out, a completed run is replayed exactly as it was, turn by turn. |
+| 🛡️ | **Resilient LLM chain** | Gemini → backup Gemini models → OpenAI, with retries on rate limits, overload and network errors. |
+
+---
+
+## 2. How a story runs
+
+```
+                ┌──────────────────────── NarrativeGraph (LangGraph) ─────────────────────────┐
+                │                                                                             │
+ scenario.json  │   ┌──────────────┐     ┌──────────────────┐     ┌──────────────┐            │
+ (story, cast,  │   │   Director   │────▶│ Character agent  │────▶│   Reviewer   │            │
+  personas,  ──▶│   │ picks speaker│     │ reasoning +      │     │ realism /    │── reject ─┐│
+  prompts,      │   │ + narrates   │     │ dialogue +       │     │ logic /      │  (1 retry)││
+  settings)     │   │ (+ twist at  │     │ free-form action │◀────│ repetition   │◀──────────┘│
+                │   │  twist turn) │     └────────┬─────────┘     └──────────────┘            │
+                │   └──────▲───────┘              │ memory + world state updated              │
+                │          │                      ▼                                           │
+                │          │  continue   ┌──────────────────┐   conclude                      │
+                │          └─────────────│ Check conclusion │──────────▶ ending narration     │
+                │                        └──────────────────┘                                 │
+                └─────────────────────────────────────────────────────────────────────────────┘
+                        │ each reviewed turn                              │ completed story
+                        ▼                                                 ▼
+               FastAPI  /api/run/stream (SSE)  ──────▶  React player      Neon Postgres (replay when LLM is down)
+```
+
+1. The API loads a scenario (`scenarios/<id>/scenario.json`) and builds one agent per character, plus a Director and a Reviewer.
+2. **Director** reads the world state and recent dialogue, then picks the next speaker and writes the scene narration.
+3. **Character** gets its persona, goals, inventory, memory, what it already said and did, and which appeals the crowd is tired of. It replies with JSON: `reasoning`, `decision` (talk / act / both), `dialogue`, `action`.
+4. **Reviewer** approves or rejects. On a major rejection the character regenerates once with the feedback.
+5. The action is validated and applied to the **world state**, and every character's **memory** is updated.
+6. **Conclusion check** ends the story only when it has been earned (see [9.6](#96-conclusion-rules)).
+7. Each turn streams to the browser as it is produced. When the story completes, it is saved to the database.
+
+---
+
+## 3. Quick start
 
 ### Prerequisites
-- Python 3.11+
-- `uv` package manager
-- Node.js 18+ (for frontend)
-- Google API Key (Gemini Free Tier)
+- **Python 3.11+** and [**uv**](https://docs.astral.sh/uv/)
+- **Node.js 18+**
+- A **Google Gemini API key** (free tier works): [Google AI Studio](https://aistudio.google.com/app/apikey)
+- Optional: a Postgres database ([Neon](https://neon.tech) free tier recommended), an OpenAI key, a gpt-oss server
 
-### Installation
+### Install
+```bash
+git clone https://github.com/fun33333/multi-agent-narrative-system.git
+cd multi-agent-narrative-system
 
-1. **Clone the repository**:
-   ```bash
-   git clone https://github.com/Noman37375/GenAi_DSS_Quadgentics.git
-   cd GenAi_DSS_Quadgentics
-   ```
+uv sync                                   # Python dependencies
+npm install                               # root tools (concurrently)
+cd frontend && npm install && cd ..       # React app
+```
 
-2. **Install backend dependencies**:
-   ```bash
-   uv sync
-   ```
+### Configure
+```bash
+cp .env.example .env
+```
+Then set at least:
+```ini
+GOOGLE_API_KEY=your_gemini_key
+ADMIN_PASSWORD=choose-a-strong-password     # enables /admin
+DATABASE_URL=postgresql://...               # scenarios, admin edits, images, every run, offline replay
+```
+All options are listed in the [configuration reference](#10-configuration-reference).
 
-3. **Install frontend dependencies**:
-   ```bash
-   cd Hackthon_Frontend_IBA/frontend
-   npm install
-   cd ../..
-   ```
-
-4. **Environment Configuration**:
-   Create a `.env` file in the root directory:
-   ```ini
-   GOOGLE_API_KEY=your_api_key_here
-   ```
-
-**First-time run checklist:** Ensure `GOOGLE_API_KEY` is set in `.env`, then from repo root run `npm run dev` (for frontend + API) or `uv run python src/main.py` (backend only). Open http://localhost:5173 for the app or check terminal for narrative output.
-
-### Troubleshooting
-
-| Issue | Fix |
-|-------|-----|
-| `GOOGLE_API_KEY` missing or invalid | Create `.env` in repo root with `GOOGLE_API_KEY=your_key`. Get a key from [Google AI Studio](https://aistudio.google.com/app/apikey) (free tier). |
-| `uv: command not found` | Install [uv](https://docs.astral.sh/uv/): `pip install uv` or use your OS package manager. |
-| Port 8000 or 5173 already in use | Stop the process using that port, or change port in `package.json` (dev:api) / Vite config (frontend). |
-| Backend runs but frontend shows "Connection lost" | Ensure API is running (`npm run dev:api` or `npm run dev`). Frontend expects `http://localhost:8000` (set `VITE_API_URL` in frontend `.env` if your API is elsewhere). |
-| `ModuleNotFoundError` or import errors | Run from **repo root** (where `src/` and `pyproject.toml` are). Use `uv run python src/main.py` not `python main.py` from inside `src/`. |
-
-## 3. Usage
-
-### Run Backend + Frontend Together
+### Run
 ```bash
 npm run dev
 ```
-This starts both the FastAPI backend (port 8000) and Vite frontend (port 5173) using `concurrently`.
+| Service | URL |
+|---|---|
+| Story player | http://localhost:5173 |
+| Admin panel | http://localhost:5173/admin |
+| API | http://localhost:8080 |
 
-### Run Backend Only (CLI mode)
+Other ways to run:
 ```bash
-uv run python src/main.py
-```
-(Run from repo root so `src` and `scenarios` resolve.)
-
-### Run Backend API Only
-```bash
-npm run dev:api
+npm run dev:api                                   # API only (port 8080)
+npm run dev:frontend                              # frontend only
+uv run python src/main.py                         # terminal only, default scenario
+uv run python src/main.py empty_buffet            # terminal only, another scenario
 ```
 
-### Run Frontend Only
-```bash
-npm run dev:frontend
-```
+> **Using a different API port?** For example, if something else already uses 8080:
+> `uv run uvicorn src.api:app --reload --port 8081`, and create `frontend/.env` with `VITE_API_URL=http://localhost:8081`.
 
-### Admin Panel (edit stories without touching code)
-1. Set a password in `.env`: `ADMIN_PASSWORD=your-password`, then restart the API.
-2. Open http://localhost:5173/admin and log in.
-3. Tabs:
-   - **Story**: title, subtitle, story seed, setting details, background image
-   - **Characters**: add/remove characters; name, label, image, colour, description, goals, inventory, deep persona, English-mode style, reviewer notes, repeated-appeal keywords, TTS voice
-   - **Prompts**: every Director, Reviewer and character prompt template, with clickable placeholders. Saving is blocked if a placeholder is unknown or a required one is missing.
-   - **Settings**: max/min turns, twist turn, turns after twist, min actions, dialogue length, temperature
-4. **New** copies the current scenario into a new one, which you then edit. Pick the scenario on the player's start screen.
+---
 
-Everything is stored in `scenarios/<id>/scenario.json` (uploaded images in `scenarios/<id>/images/`). The next story run uses the saved changes; no restart needed.
-Note: on hosts with an ephemeral disk (e.g. Hugging Face Spaces), edits made through the panel are lost on restart. Commit `scenarios/` to keep them.
+## 4. The story player
 
-### New Scenario with AI
-In the admin panel, **✨ New with AI** turns a one- or two-line idea (Roman Urdu or English) into a complete scenario:
-story seed, setting, characters (description, goals, inventory, deep persona, English style, appeal keywords,
-reviewer notes, voice, colour) and every Director / Reviewer / character prompt adapted to the new scene.
+The start screen is a menu with three choices:
 
-- Model: self-hosted **gpt-oss** (`GPT_OSS_BASE_URL`, OpenAI-compatible). If that server is down, **Gemini** is used
-  with its own models (`SCENARIO_GEMINI_MODEL`, default `gemini-3.5-flash`) so the story models' daily quota is untouched. Paid OpenAI is never used here.
-- The Rickshaw scenario is the quality reference: the model is shown it and must match its depth.
-  Work is split into a blueprint, one call per character and one per prompt; every prompt is checked
-  (placeholders, JSON braces) and sent back for fixing if broken.
-- The result is saved as a **Draft** (hidden from the player). Add images, review, set Status to **Published**, Save.
-- Takes ~1–7 minutes depending on the model.
+| Option | What happens |
+|---|---|
+| **Continue** | Shown when the selected scenario has an unfinished run (the AI stopped, the browser closed, the server restarted). The AI picks the **same run** back up from its last saved turn, with the same memories and world state, and the player jumps straight to that turn. |
+| **New story** | Pick a **scenario** (Kahani) and a **language** (Roman Urdu or English). The AI writes a brand-new story. |
+| **Purani stories** | Every saved run, newest first, for this scenario or all of them. Each shows **Poori** (complete) or **Adhoori** (unfinished), its turn count, language and date. **Play** watches it again; **Continue** is available on unfinished runs. |
 
-### Saved Stories & Fallback (Neon Postgres)
-Set `DATABASE_URL` in `.env` (any Postgres; Neon recommended). The `stories` table is created automatically.
+- **Live streaming:** turns appear as soon as the agents produce them (SSE).
+- **Scene view:** a full-screen background, the speaking character's image and name, and the Director's narration (expandable).
+- **Typewriter dialogue:** lines type out and any physical action is shown under the dialogue.
+- **Voices:** "Listen" reads the line aloud with the character's own voice, speed and pitch (Microsoft Edge TTS).
+- **Auto-play:** plays every turn with audio and advances by itself.
+- **Navigation:** Prev / Next, a progress bar and turn dots, plus a replay button.
+- **Character cards:** the whole cast along the bottom, with the current speaker highlighted.
+- **No images yet?** Characters without an image show coloured initials, and scenarios without a background get a plain dark scene.
+- **Menu** (🏠 in the controls, or after the ending) goes back to the start menu at any time.
 
-- Every story that **completes** (has an ending and no failed `...` turns) is saved exactly as shown in the player.
-- Before starting a story, the API makes one tiny LLM call. If it fails (API key invalid, quota exhausted), a saved story for the same scenario is replayed as-is, turn by turn (`REPLAY_TURN_DELAY` seconds apart). Same language is preferred; the least-shown story is picked first.
-- `GET /api/run/stream?mode=auto|live|saved`: `auto` (default) = live, or replay if the LLM is down; `live` = always generate; `saved` = always replay.
-- Without `DATABASE_URL`, or if the database is unreachable, stories still run live; they just aren't saved.
+---
 
-To run the CLI with another scenario: `uv run python src/main.py <scenario_id>`.
+## 5. The admin panel
 
-The system will:
-1. Load the scenario (story, characters, personas, prompts, settings) from `scenarios/rickshaw_accident/scenario.json`.
-2. Initialize 4 character agents + 1 Director agent + 1 Reviewer agent.
-3. Run the narrative loop (15-25 turns) with open-ended actions, memory updates, an LLM-generated twist, and per-turn reviewer checks.
-4. Generate `story_output.json` and `prompts_log.json`.
-5. Stream each turn to the frontend in real-time via SSE.
+Open **`/admin`** and log in with `ADMIN_PASSWORD`. If the variable is not set, the panel is disabled. Sessions last 12 hours, and changing the password logs everyone out.
 
-## 4. System Architecture
+| Tab | What you can edit |
+|---|---|
+| **Story** | Status (Draft / Published), title, subtitle, story seed, setting details (JSON), background image |
+| **Characters** | Add or remove characters (minimum 2). Per character: name, display label, key, image upload, colour, short description, goals, inventory, **deep persona**, English-mode style, Reviewer notes (Urdu / English), repeated-appeal keywords, TTS voice / speed / pitch |
+| **Prompts** | All 9 templates: character main prompt, Roman Urdu rule, English rule, Director (pick speaker, twist, conclusion), Reviewer (Urdu, English), fallback ending. Placeholders can be inserted with one click. |
+| **Settings** | Max / min turns, twist turn, turns after twist, minimum physical actions, dialogue length, temperature |
+| **History** | Every saved version of the scenario, with a note ("Saved from admin panel", "Generated with AI", "Restored version 3"…). View any version and **Restore** it; a restore is saved as a new version, so nothing is ever lost |
 
-### 4.1 Multi-Agent Design
+**Safety checks**
+- A prompt can't be saved with an unknown placeholder, a missing required placeholder, or broken `{ }` braces. This is checked in the browser and again on the server.
+- Unsaved changes are flagged, and the panel asks before you leave or switch scenarios.
+- The default scenario (`rickshaw_accident`) cannot be deleted.
 
-The system follows a **Director-Agent** architecture orchestrated by a LangGraph `StateGraph`:
+**Scenarios**
+- **New** copies the current scenario, including its images.
+- **✨ New with AI** writes a brand new one (next section).
+- **Export** downloads a scenario as one JSON file with its images embedded; **Import** loads such a file (or a plain `scenario.json`) as a new scenario.
+- **Drafts** stay hidden from the player until their status is set to **Published**.
+- Changes are saved to the database and apply to the **next** story run, with no restart needed.
 
-```
-┌───────────────────────────────────────────────────────────┐
-│                    NarrativeGraph                          │
-│                 (LangGraph StateGraph)                     │
-│                                                           │
-│  ┌──────────────┐   ┌────────────────┐   ┌────────────┐  │
-│  │  Director     │──>│ Character Agent │──>│  Reviewer   │  │
-│  │  Selects      │   │ Responds (with  │   │  (Karachi   │  │
-│  │  Speaker +    │   │ reasoning,      │   │  realism    │  │
-│  │  Narrates     │   │ dialogue,       │   │  check)     │  │
-│  │  scene        │   │ open-ended      │   └──────┬─────┘  │
-│  └──────┬───────┘   │ action)         │    retry if reject │
-│         │           └────────┬───────┘          │         │
-│         │                    │                   │         │
-│         ▼                    ▼                   │         │
-│  ┌───────────────────────────────┐               │         │
-│  │     Check Conclusion          │               │         │
-│  │  (min turns, min actions,     │               │         │
-│  │   post-twist breathing room)  │               │         │
-│  └────────────┬──────────────────┘               │         │
-│               │                                  │         │
-│     continue ─┤── conclude ──> END               │         │
-│               │                                  │         │
-│  ┌────────────▼────────────────┐                 │         │
-│  │ LLM-Generated Twist @ Turn 9│                 │         │
-│  │ (Director generates unique   │                 │         │
-│  │  context-aware complication)  │                │         │
-│  └──────────────────────────────┘                │         │
-│                                                  │         │
-│  Memory updates + World State after each turn    │         │
-│  Action validation + pattern-based execution     │         │
-└───────────────────────────────────────────────────────────┘
+**Stories** (switch at the top of the panel)
+- A list of every run: run number, scenario, language, status, turns, whether it's in the replay pool. Filter by scenario, status (completed / incomplete / failed / aborted / running) and language.
+- Open a run to see its **timeline**, grouped by turn: the Director's narration and who it chose (and any anti-repetition override), the twist, each character's line with its **hidden reasoning** and decision, drafts the Reviewer rejected and why, actions (including rejected ones), the world state after each turn, the Director's conclusion checks, the ending and any errors.
+- **As shown to viewers** shows the final story; **LLM prompts** shows every prompt and response with model and latency.
+- Include or exclude a run from the offline replay pool, export it as JSON, or delete it. A run that is still generating updates live.
 
-┌───────────────────────────────────────────────────────────┐
-│                   Frontend + API                          │
-│                                                           │
-│  FastAPI (src/api.py)          React (Vite)               │
-│  - POST /api/run               - SSE EventSource          │
-│  - GET /api/story              - Turn-by-turn display     │
-│  - GET /api/run/stream (SSE)   - Auto-advance on new turn │
-└───────────────────────────────────────────────────────────┘
-```
+**Without a database** the panel opens read-only (a banner explains why): scenarios come from the backup JSON files and nothing can be saved.
 
-### 4.2 Agent Roles
+---
 
-| Agent | Role | Key Capability |
-|---|---|---|
-| **Director** | Orchestrator | Selects speakers, narrates scenes, generates twists, checks conclusion |
-| **4 Character Agents** | Autonomous actors | Each has deep psychological persona, memory, reasoning, open-ended actions |
-| **Reviewer** | Quality gate | Checks each turn for Karachi realism, language, logic, repetition |
+## 6. New scenario with AI
 
-## 5. Implemented Features
+Click **✨ New with AI** and describe a scene in a line or two, in Roman Urdu or English:
 
-### 5.1 Character Memory System
-Each character maintains an individual memory buffer (sliding window of 20 entries) that tracks:
-- What they said and did in previous turns
-- What other characters said and did (cross-character propagation)
-- World events and story twists
+> *Lahore ki shaadi mein khana waqt se pehle khatam ho gaya. Dulhe ka baap, caterer, dulhan ki phuppo aur photographer aamne saamne.*
 
-Memory is stored in `StoryState.character_memories` as per-character lists and fed into each character's prompt.
+Choose the number of characters (2–6). The AI then writes **everything**:
 
-### 5.2 Open-Ended Action System
+| Generated | Details |
+|---|---|
+| Story | Title, subtitle (exact location), a 120–180 word story seed, setting details |
+| Dramatic engine | Core conflict, why nobody can leave, what the resolution is paid in, possible complications |
+| Characters | Name, label, description, goals, inventory, leverage, vulnerability, voice (gender-appropriate, with distinct speed and pitch), colour |
+| Deep personas | 350–550 words each, in the same structure as the built-in characters: psychology, language, tactics in four turn bands, situational intelligence, flaw, forms of address, "never do" rules. Also English style, appeal keywords and Reviewer notes |
+| Prompts | Director, Reviewer and character prompts rewritten for the new scene, with every placeholder kept intact |
 
-**Design Philosophy**: Rather than restricting characters to a fixed menu of actions, the system allows **any realistic physical action**. Characters can grab keys, throw money, sit on the ground, block a path, make a phone call, push someone, wave down a passerby — anything a real person would do on a Karachi street.
+**How quality is kept high**
+- The built-in **Rickshaw scenario is shown to the model as the reference** it has to match in depth and specificity.
+- The work is split into focused steps: blueprint → one call per character (in parallel) → one call per prompt (in parallel).
+- Every output is **checked automatically**, including required persona sections, minimum length, appeal format, placeholders and JSON braces. Anything that fails is sent back to the model with the exact problem, up to 2 times.
 
-The system uses **pattern-matching** to categorize actions for world-state tracking:
+**Model:** your self-hosted **gpt-oss** server (`GPT_OSS_BASE_URL`). If that server is down, **Gemini** is used with its *own* models (`gemini-3.5-flash`, then lite models), so the story models' daily quota is untouched. Paid OpenAI is never used by the generator.
 
-| Pattern | World State Effect | Example |
-|---|---|---|
-| money/pay/give | `money_exchanged`, `money_from`, `money_to` | `Give_Money → Ahmed Malik` |
-| bribe/chai_pani | `bribe_offered`, `bribe_from`, `bribe_to` | `Offer_Bribe → Constable Raza` |
-| challan/ticket/fine | `challan_written`, `challan_target` | `Write_Challan → Saleem` |
-| key/confiscate/snatch | `keys_confiscated`, `keys_taken_from` | `Grab_Keys → Ahmed Malik` |
-| record/video/film | `being_recorded`, `recorder` | `Record_Video` |
-| block/stand_in_front | `vehicle_blocked`, `vehicle_blocked_by` | `Block_Path → Ahmed Malik` |
-| push/shove/grab | `physical_confrontation_{actor}` | `Push_Away → Constable Raza` |
-| call/phone/dial | `{actor}_made_call` | `Call_Lawyer` |
-| sit/ground/collapse | `{actor}_on_ground` | `Sit_On_Road` |
-| cry/wail/sob | `{actor}_crying` | `Break_Down_Crying` |
-| *(any other)* | `action_{type}_{actor}` | `Tear_Document`, `Wave_Down_Taxi` |
+Progress streams into the dialog, and a run takes about 1–7 minutes. The result opens as a **Draft**: add images, review it, set Status to **Published**, and save.
 
-Validation only checks: action is non-empty, target (if given) exists in character profiles, and actor is not targeting themselves.
+---
 
-### 5.3 Deep Psychological Personas
+## 7. Database, run records & offline replay
 
-Each character has a complete psychological profile that drives behavior:
+Set `DATABASE_URL` (any Postgres; Neon recommended). On startup the API brings the schema up to date with **Alembic** migrations, then imports anything it doesn't have yet.
 
-- **Saleem** (rickshaw driver): Street-smart poverty psychology. 95% Roman Urdu. Knows when to cry, when to get angry, when to play the victim. Tactical evolution from shock → anger → strategy → negotiation across turns.
-- **Ahmed Malik** (businessman): Elite Karachiite psychology. English-Urdu code-switching. Oscillates between authority and fear of the crowd. Evolution from dismissive → frustrated → panicked → resigned.
-- **Constable Raza** (traffic cop): Corrupt but cunning. 90% blunt street Urdu. Sees every situation as revenue. Plays both sides. Fear of cameras and DSP. Evolution from assessment → squeezing → negotiation → self-preservation.
-- **Uncle Jameel** (shopkeeper elder): Lives for drama. 95% dramatic Urdu. Self-appointed mediator. Sides with the poor but presents as fair. Evolution from dramatic arrival → mediation → taking sides → brokering the deal.
+**What is stored**
 
-Each persona includes explicit "WHAT YOU WOULD NEVER DO" rules and turn-range tactical evolution guidelines.
+| Table | Contents |
+|---|---|
+| `scenarios` | Title, subtitle, story seed, setting, background image, status, story settings, current version |
+| `characters` | One row per character: persona, English style, goals, inventory, appeals, reviewer notes, voice, image, colour, order |
+| `prompts` | The 9 prompt templates of each scenario |
+| `images` | Image files themselves (served at `/api/images/<id>`; identical files are stored once) |
+| `scenario_versions` | A full snapshot of the scenario at every save, with a note |
+| `story_runs` | One row per run (the **run number**): scenario + version, language, status, start/end time, turns, actions, twist turn, ending, models used, LLM call count, error, replay-pool flag, times replayed, and the **checkpoint** (full story state after the last turn) with how often the run was continued |
+| `story_events` | Every step of a run, in order: `director_narration`, `twist`, `rejected_dialogue`, `review`, `dialogue` (+ reasoning, decision), `action`, `world_state`, `conclusion_check`, `conclusion`, `error` |
+| `llm_calls` | Every prompt and response (story agents and the scenario generator): agent, model, latency, success/error. Kept for `LLM_LOG_RETENTION_DAYS` (default 30) |
 
-### 5.4 Reasoning Layer
-Characters respond with structured JSON containing:
+**How it behaves**
+- Events are written **as they happen** through a background queue, so recording never slows the story down. If a run stops halfway, what happened so far is kept, with status `failed` or `aborted`. Runs cut off by a server restart are marked `aborted` on the next start.
+- **Checkpoint after every turn:** the run's turns so far and its full story state (memories, world state, events) are saved after each turn. An unfinished run (`failed` / `aborted` / `incomplete` without an ending) can be **continued** from the player: the AI resumes the same run number from its last saved turn. When a story gets its ending the checkpoint is cleared, and the run can only be played again.
+- **Every run can be watched again** from the player's **Purani stories** list, complete or not.
+- A run is `completed` when it has an ending and no failed (`...`) turns. Only completed runs join the **replay pool**.
+- **When the LLM is down:** before a story starts, the API makes one tiny LLM call. If it fails (invalid key, exhausted quota, outage), a completed run of the same scenario is **replayed as-is**, turn by turn (`REPLAY_TURN_DELAY` seconds apart). Same language first, least-replayed first.
+- `GET /api/run/stream?mode=` `auto` (default: live, or replay if the LLM is down) · `live` (always generate) · `saved` (always replay).
+- **Files stay in sync:** every save is also written to `scenarios/<id>/scenario.json` as a backup (and for git). Scenario files that aren't in the database yet, such as ones added through git, are imported on startup. The database is never overwritten by files.
+- **If the database is unavailable,** the player keeps working from those JSON files (images fall back to initials), stories still run live but aren't recorded, and the admin panel is read-only. The app retries while Neon wakes up and reconnects later.
+- Manual import: `uv run python -m src.import_data` · manual migration: `uv run alembic upgrade head`.
+
+> Tip: run a few stories per scenario while your API key works, so the replay pool has something to fall back on.
+
+---
+
+## 8. LLM models & resilience
+
+| Task | Model chain |
+|---|---|
+| **Running a story** (Director, characters, Reviewer) | `GEMINI_MODEL` (default `gemini-2.5-flash`) → `GEMINI_FALLBACK_MODELS` (`gemini-2.5-flash-lite`, `gemini-flash-latest`) → OpenAI `OPENAI_MODEL` *(only if `OPENAI_API_KEY` is set)* |
+| **New with AI** | gpt-oss (`GPT_OSS_BASE_URL`) → `SCENARIO_GEMINI_MODEL` (`gemini-3.5-flash`) → `SCENARIO_GEMINI_FALLBACK_MODELS`. **Never OpenAI** |
+
+- **Retries:** rate limits (429), overload (503), network / DNS errors and empty responses are retried with increasing waits before moving on.
+- **Quota note:** Gemini's free tier limits requests **per model per day** (around 20 for `gemini-2.5-flash`), and one story uses 60+ calls. That's why the chain spans several models, and why the generator uses separate ones.
+- **OpenAI is paid.** Leave `OPENAI_API_KEY` empty if you'd rather fall back to saved stories than pay.
+
+---
+
+## 9. The story engine in depth
+
+### 9.1 Character memory
+Each character keeps a rolling memory of 20 entries: what it said, what others said, twists, and actions done to it. The last 10 entries go into its prompt, along with its own last 5 lines and every action it has already performed, so it doesn't repeat itself.
+
+### 9.2 Open-ended actions
+Characters aren't limited to a menu. Any realistic physical action is allowed, and pattern matching turns it into world-state changes that later prompts can see:
+
+| Action contains | World state |
+|---|---|
+| money / pay / give | `money_exchanged`, `money_from`, `money_to` |
+| bribe / chai_pani | `bribe_offered`, `bribe_from`, `bribe_to` |
+| challan / ticket / fine | `challan_written`, `challan_target` |
+| key / confiscate / snatch | `keys_confiscated`, `keys_taken_from` |
+| record / video / film | `being_recorded`, `recorder` |
+| block / stand_in_front | `vehicle_blocked`, `vehicle_blocked_by` |
+| show / display / hold_up | `{actor}_showed_something` |
+| call / phone / dial | `{actor}_made_call` |
+| chai / tea | `chai_offered` |
+| sit / ground / collapse | `{actor}_on_ground` |
+| push / shove / grab | `physical_confrontation_{actor}` |
+| cry / wail / sob | `{actor}_crying` |
+| whistle / blow | `whistle_blown` |
+| *anything else* | `action_{type}_{actor}` |
+
+Validation only checks that the action has a type, that its target (if any) is an existing character, and that the actor isn't targeting itself.
+
+### 9.3 Reasoning layer
+Every character turn is structured JSON, which forces the model to think before it speaks:
 ```json
 {
-    "reasoning": "Internal thought about strategy and what has changed",
-    "decision": "talk | act | both",
-    "dialogue": "Spoken words in character voice",
-    "action": {
-        "type": "Free-form label (e.g., Grab_Keys, Sit_On_Road, Throw_Money)",
-        "target": "character name or null",
-        "description": "Vivid description of the physical action"
-    }
+  "reasoning": "What changed and what my strategy is this turn",
+  "decision": "talk | act | both",
+  "dialogue": "Spoken line, in character",
+  "action": { "type": "Grab_Keys", "target": "Ahmed Malik", "description": "What exactly I physically do" }
 }
 ```
-The `reasoning` field captures the agent's internal decision-making — forcing chain-of-thought before speaking or acting.
 
-### 5.5 LLM-Generated Story Twists
+### 9.4 Deep personas & anti-repetition
+- Personas change tactics by turn band (1–3, 4–6, 7–9, 10+), so characters escalate instead of looping.
+- **Appeal decay:** each character has appeal keywords (for example "mere bachche"). The engine counts how often each appeal has been used and tells the character the crowd is tiring of it: *Fresh → Used once → Tiring → Worn out*.
+- **Three layers against repetition:** code (no speaker twice in a row, no two-character ping-pong for 4+ turns), context (previous lines and actions shown with "say something new"), and the Reviewer.
 
-At turn 9, the **Director agent generates a unique, context-aware twist** via a dedicated LLM call (`DIRECTOR_TWIST_PROMPT`). The twist:
-- Is based on everything that has happened in the story so far
-- Is realistic for a Karachi street scene
-- Changes the dynamic for at least 2 characters
-- Cannot be ignored — characters must react
+### 9.5 Director & twists
+- A 4-phase arc: **Setup (1–4) → Escalation (5–9) → Complication (10–15) → Climax & resolution (16+)**.
+- Narration must add at least one new sensory detail every turn.
+- At `twist_turn` (default 9) the Director **invents a twist** from the story so far. It updates the world state and every character's memory.
 
-Each run produces a **different twist** because it's generated from context, not selected from a fixed list. Examples from actual runs: "dhaba gas cylinder explosion nearby", "senior officer spotted approaching", "mechanic discovers hidden damage."
+### 9.6 Conclusion rules
+A story can only end after `min_turns` turns and `min_actions` physical actions, at least `post_twist_turns` turns after the twist, and on alternating turns until close to the limit. At `max_turns` it is always closed with a Director-written ending (or the scenario's fallback ending). The Director's prompt also requires a real deal, a twist, and every character to have spoken.
 
-Twists update `world_state` and inject into ALL characters' memories, with 5-turn post-twist breathing room before conclusion is allowed.
+### 9.7 Reviewer
+A lifelong local of the scene's setting who checks four things: **language realism** (per-character notes from the scenario), **logical consistency** (realistic amounts and reactions), **repetition**, and **action logic**. Major issues trigger one regeneration with the suggestion. Minor issues are logged only.
 
-### 5.6 Reviewer Agent
+---
 
-A fifth agent runs after each character turn, acting as a "born-and-raised Karachiite" quality gate. It checks:
+## 10. Configuration reference
 
-1. **Language realism** — Saleem must not speak like a lawyer; Raza must sound blunt, not polite; Ahmed must code-switch naturally.
-2. **Logical consistency** — Would a man earning 800/day refuse 20,000? Are damage amounts realistic (rickshaw bumper: 2,000-5,000, not 50,000)?
-3. **Repetition** — Same emotional appeal or argument repeated? Same tactic with different words?
-4. **Action logic** — Does the physical action fit the current moment?
+All settings live in `.env` (copy from `.env.example`). Restart the API after changing it.
 
-If the reviewer rejects (major severity), the character gets **one retry** with the reviewer's suggestion appended to context. All reviewer calls are logged in `prompts_log.json`.
-
-### 5.7 Director Intelligence
-- **Story Phase System**: Setup (1-4) → Escalation (5-9) → Complication (10-15) → Resolution (16-22)
-- **Anti-Consecutive**: Code-level enforcement prevents same character speaking twice in a row
-- **Anti-Ping-Pong**: Detects when 2 characters dominate for 4+ turns and forces a third
-- **Conclusion Resistance**: min_turns (15), min_actions (5), post-twist breathing room (5 turns), even-turn checks before turn 18, max_turns (25) hard cap
-
-### 5.8 FastAPI Backend + React Frontend
-
-**Backend** (`src/api.py`):
-- `POST /api/run` — Run full narrative, return frontend-shaped payload
-- `GET /api/story` — Return last story (200 with empty payload when none)
-- `GET /api/run/stream` — SSE streaming: each reviewed turn sent as it's generated
-
-**Frontend** (`Hackthon_Frontend_IBA/frontend/`):
-- EventSource for real-time SSE streaming
-- Turn-by-turn display with character avatars
-- Auto-advance when new turn arrives during streaming
-- Next button disabled while waiting for next turn
-- Shows narration, dialogue, and action text per turn
-
-## 6. Documentation and Deliverables
-
-| Deliverable | Location | PDF (for submission) |
-|-------------|----------|----------------------|
-| **README** | This file | — |
-| **Technical Report** | `Technical_Report.md` | Generate PDF: `pandoc Technical_Report.md -o Technical_Report.pdf` (requires [pandoc](https://pandoc.org/)). Alternatively use the provided `Technical_Report.tex` with `pdflatex Technical_Report.tex`. |
-
-The problem statement asks for a PDF (LaTeX) technical report. We provide the report in Markdown and LaTeX source; use the commands above to produce the PDF. A pre-built `Technical_Report.pdf` may be included in the submission package.
-
-## 7. Output Files
-
-**`story_output.json`** — Final narrative trace:
-- `title`, `seed_story` (metadata)
-- `events[]` — chronological list with `type` (dialogue/narration/action), `speaker`, `content`, `turn`
-- `conclusion` — why the story ended
-- `metadata` — total turns, total actions, conclusion reason
-
-**`prompts_log.json`** — Debug/audit log:
-- `timestamp`, `agent`, `prompt`, `response` for every LLM call (Director, Character, Reviewer)
-
-## 8. Configuration
-
-| Parameter | Default | Description |
+| Variable | Default | Purpose |
 |---|---|---|
-| `model_name` | `gemma-3-27b-it` | LLM model (Google Generative AI free tier) |
-| `temperature` | `0.75` | Slightly higher for creative, varied output |
-| `max_turns` | `25` | Maximum dialogue turns |
-| `min_turns` | `15` | Minimum before conclusion allowed |
-| `max_tokens_per_prompt` | `2000` | Max generation tokens |
-| `max_context_length` | `4000` | Max input context |
-| `max_consecutive_same_character` | `1` | Anti-repetition threshold |
-| `num_characters` | `4` | Number of character agents |
+| `GOOGLE_API_KEY` | — | Gemini key (stories, and generator fallback) |
+| `GEMINI_MODEL` | `gemini-2.5-flash` | Main story model |
+| `GEMINI_FALLBACK_MODELS` | `gemini-2.5-flash-lite,gemini-flash-latest` | Backup story models |
+| `OPENAI_API_KEY` | *(empty)* | Optional paid last-resort for stories |
+| `OPENAI_MODEL` | `gpt-5` | OpenAI model |
+| `ADMIN_PASSWORD` | *(empty = admin disabled)* | Admin panel password |
+| `DATABASE_URL` | *(empty = no database)* | Postgres URL (Neon: use the pooled connection string). Stores scenarios, images, versions and every run |
+| `REPLAY_TURN_DELAY` | `2.5` | Seconds between turns when replaying a saved run |
+| `LLM_LOG_ENABLED` | `true` | Store every LLM prompt and response |
+| `LLM_LOG_RETENTION_DAYS` | `30` | Delete logged prompts older than this (checked at startup and daily) |
+| `GPT_OSS_BASE_URL` | *(empty)* | Your gpt-oss server (OpenAI-compatible, e.g. `http://host:8000/v1`) |
+| `GPT_OSS_MODEL` | `gpt-oss-120b` | gpt-oss model name |
+| `GPT_OSS_API_KEY` | *(empty)* | gpt-oss server key, if it needs one |
+| `GPT_OSS_REASONING_EFFORT` | `medium` | `low` / `medium` / `high` |
+| `SCENARIO_GEMINI_MODEL` | `gemini-3.5-flash` | Generator's Gemini fallback |
+| `SCENARIO_GEMINI_FALLBACK_MODELS` | `gemini-3.5-flash-lite,gemini-3.1-flash-lite` | More generator fallbacks |
+| `GPT_OSS_MAX_TOKENS` / `GPT_OSS_TIMEOUT` / `SCENARIO_GEN_PARALLEL` | `12000` / `600` / `3` | Optional generator tuning |
 
-## 9. Features Beyond Requirements
+Frontend: `frontend/.env` → `VITE_API_URL` (default `http://localhost:8080`).
 
-The problem statement requires Memory, Actions, and Reasoning. Our system adds **8 novel extensions**:
+**Per-scenario story settings** (admin → Settings):
 
-| # | Feature | Description |
+| Setting | Default | Meaning |
 |---|---|---|
-| 1 | **Reviewer Agent** | 6th agent validates every turn for Karachi realism, language, logic, repetition |
-| 2 | **Deep Psychological Personas** | Multi-paragraph character psychology with tactical evolution per turn range |
-| 3 | **LLM-Generated Twists** | Director creates unique context-aware twist each run (not from a fixed list) |
-| 4 | **Open-Ended Actions** | 13-category pattern-matching on free-form actions + catch-all |
-| 5 | **3-Layer Anti-Repetition** | Code + context + reviewer prevents repetition at every level |
-| 6 | **5-Mechanism Conclusion Resistance** | min_turns, min_actions, post-twist buffer, gating, max_turns |
-| 7 | **4-Phase Story Structure** | Director follows Setup → Escalation → Complication → Resolution |
-| 8 | **Real-Time Frontend + SSE** | React app streams turns live via Server-Sent Events |
+| `max_turns` | 20 | Story is always closed at this turn |
+| `min_turns` | 8 | No ending before this |
+| `twist_turn` | 9 | When the Director injects a twist |
+| `post_twist_turns` | 5 | Minimum turns after the twist |
+| `min_actions` | 5 | Physical actions needed before an ending |
+| `max_dialogue_length` | 250 | Length hint for each line |
+| `temperature` | 0.85 | Creativity (0–2) |
 
-## 10. Key Files
+---
 
-| File | Purpose |
+## 11. Scenario file format
+
+Scenarios live in the database; each one is also mirrored to `scenarios/<id>/scenario.json` (the format below, also used by Export / Import). Images saved in the database are referenced as `/api/images/<id>`.
+
+```jsonc
+{
+  "id": "rickshaw_accident",
+  "status": "published",                 // or "draft" (hidden from the player)
+  "title": "The Rickshaw Accident",
+  "subtitle": "Shahrah-e-Faisal, Karachi",
+  "description": "The story seed every agent sees…",
+  "setting": { "location": "…", "time": "…", "weather": "…", "crowd": "…" },
+  "background_image": "/img12.png",
+  "settings": { "max_turns": 20, "min_turns": 8, "twist_turn": 9, "…": "…" },
+  "characters": [{
+    "key": "saleem", "name": "Saleem", "label": "Saleem (Rickshaw Driver)",
+    "description": "…", "goals": ["…"], "inventory": ["…"],
+    "persona": "YOU ARE SALEEM — A DESPERATE RICKSHAW DRIVER. …",
+    "english_style": "…",
+    "appeals": { "Bachche/children appeal": ["bachche", "my kids", "…"] },
+    "review_notes_urdu": "…", "review_notes_english": "…",
+    "voice": { "voice": "hi-IN-MadhurNeural", "rate": "+15%", "pitch": "-4Hz" },
+    "image": "/img4.png", "color": "amber"
+  }],
+  "prompts": {
+    "character": "{persona}\n\n{context}\n…",
+    "character_language_urdu": "…", "character_language_english": "…",
+    "director_select_speaker": "…", "director_twist": "…", "director_conclusion": "…",
+    "reviewer_urdu": "…", "reviewer_english": "…",
+    "fallback_conclusion": "Plain-text ending used if the Director fails"
+  }
+}
+```
+Prompts are Python `str.format` templates: `{placeholder}` is filled by the engine, and literal braces are written `{{ }}`. The admin panel lists the allowed and required placeholders for each prompt.
+
+Included scenarios: **The Rickshaw Accident** (default), **Khaali Degche Aur Hungama**, and the drafts **Empty Buffet** and **The Stuck Lift** (AI-generated).
+
+---
+
+## 12. API reference
+
+**Public**
+| Method | Path | Description |
+|---|---|---|
+| GET | `/api/scenarios` | Published scenarios |
+| GET | `/api/scenarios/{id}` | Player view of a scenario (no prompts) |
+| GET | `/api/images/{id}` | Image stored in the database |
+| GET | `/api/scenarios/{id}/images/{file}` | Legacy image file from `scenarios/<id>/images/` |
+| GET | `/api/run/stream?scenario=&lang=urdu\|english&mode=auto\|live\|saved` | Run a story as SSE: `meta`, `turns`, `conclusion`, `done`, `error` |
+| POST | `/api/run?scenario=&lang=` | Run a full story and return it at once (also writes `story_output.json`, `prompts_log.json`) |
+| GET | `/api/run/stream?continue_run=<run id>` | Continue an unfinished run from its last saved turn (sends the saved turns first, then new ones) |
+| GET | `/api/runs?scenario=&continuable=true\|false&limit=&offset=` | Saved runs for the player (every run with at least one turn), newest first |
+| GET | `/api/runs/{id}` | One saved run: turns + ending, to play again |
+| GET | `/api/story` | Last story |
+| GET | `/api/tts?text=&speaker=&scenario=` | MP3 speech in the character's voice |
+
+**Admin** (header `Authorization: Bearer <token>`)
+| Method | Path | Description |
+|---|---|---|
+| POST | `/api/admin/login` | `{password}` → `{token}` (valid 12 h) |
+| GET | `/api/admin/meta` | Placeholders per prompt, voices, colours, default settings, database status |
+| GET | `/api/admin/scenarios` | All scenarios including drafts |
+| GET / PUT / DELETE | `/api/admin/scenarios/{id}` | Read / validate + save / delete |
+| POST | `/api/admin/scenarios` | Create a copy: `{id, title, copy_from}` |
+| POST | `/api/admin/scenarios/generate` | New with AI: `{brief, num_characters}` → SSE `progress`, `done`, `error` |
+| POST | `/api/admin/scenarios/{id}/images` | Upload an image to the database: `{filename, data (base64)}` (PNG / JPG / WEBP, ≤ 5 MB) |
+| GET | `/api/admin/scenarios/{id}/versions` | Version history |
+| GET | `/api/admin/scenarios/{id}/versions/{v}` | One saved version |
+| POST | `/api/admin/scenarios/{id}/versions/{v}/restore` | Restore a version (saved as a new version) |
+| GET | `/api/admin/scenarios/{id}/export` | Download the scenario with embedded images |
+| POST | `/api/admin/scenarios/import` | Import an export (or plain `scenario.json`) as a new scenario |
+| GET | `/api/admin/runs?scenario=&status=&language=&limit=&offset=` | Recorded runs, newest first, with status counts |
+| GET | `/api/admin/runs/{id}` | A run with every event in order |
+| GET | `/api/admin/runs/{id}/llm-calls` | Every prompt/response of a run |
+| PATCH | `/api/admin/runs/{id}` | `{in_replay_pool: true\|false}` |
+| DELETE | `/api/admin/runs/{id}` | Delete a run with its events and prompts |
+
+---
+
+## 13. Project structure
+
+```
+├── src/
+│   ├── api.py                  FastAPI: player, streaming, TTS, admin, replay fallback
+│   ├── main.py                 Terminal runner (optional scenario id argument)
+│   ├── config.py               StoryConfig (built from a scenario's settings)
+│   ├── db.py                   Database connection + migrations on startup (async SQLAlchemy + asyncpg)
+│   ├── models.py               Tables: scenarios, characters, prompts, images, versions, runs, events, llm_calls
+│   ├── scenario_store.py       Scenarios in the database (+ JSON mirror, read-only fallback, versions, images, export/import)
+│   ├── run_recorder.py         Records every run step by step; replay picking; admin run queries
+│   ├── import_data.py          Imports scenario files + images and old saved stories into the database
+│   ├── scenarios.py            Validation, placeholder rules, JSON file format
+│   ├── scenario_generator.py   "New with AI": prompts, checks, gpt-oss → Gemini chain
+│   ├── schemas.py              Pydantic models: StoryState, CharacterProfile, DialogueTurn
+│   ├── story_state.py          Initial state, memories, goals, inventory
+│   ├── actions.py              Open-ended action validation + world-state effects
+│   ├── graph/narrative_graph.py   LangGraph loop, twist, anti-repetition, conclusion rules
+│   ├── agents/
+│   │   ├── base_agent.py       LLM chain + retries + logging
+│   │   ├── character_agent.py  Structured reasoning / dialogue / action
+│   │   ├── director_agent.py   Speaker choice, narration, twist, conclusion
+│   │   └── reviewer_agent.py   Realism / logic / repetition gate
+│   └── prompts/character_prompts.py   Builds character prompts from scenario templates
+├── alembic/                    Database migrations (run automatically on API start)
+├── scenarios/<id>/scenario.json (+ images/)   Backup/mirror of each scenario (source of truth: database)
+├── frontend/                   React 19 + Vite + Tailwind 4 + Framer Motion
+│   └── src/  App.jsx (player) · admin/AdminApp.jsx (scenario editor) · admin/RunsView.jsx (Stories) · lib/api.js
+├── Dockerfile                  API container (port 7860, e.g. Hugging Face Spaces)
+├── Technical_Report.md         Technical report (design and evaluation notes)
+└── .env.example                All configuration options
+```
+
+---
+
+## 14. Deployment
+
+- **API:** `docker build -t narrative . && docker run -p 7860:7860 --env-file .env narrative`. The Dockerfile targets Hugging Face Spaces (port 7860).
+- **Frontend:** `cd frontend && npm run build`, then serve `frontend/dist` from any static host. Set `VITE_API_URL` to your API URL before building.
+- **Database:** use Neon or any Postgres through `DATABASE_URL`. Scenarios, admin edits, images, history and every run live there, so nothing is lost when a host with an ephemeral disk (such as Hugging Face Spaces) restarts. Migrations run automatically on start.
+- Use a strong `ADMIN_PASSWORD` in production, and never commit `.env`.
+
+---
+
+## 15. Troubleshooting
+
+| Symptom | Fix |
 |---|---|
-| `src/main.py` | CLI entry point — loads config, initializes agents, runs graph |
-| `src/api.py` | FastAPI server — POST /api/run, GET /api/story, GET /api/run/stream (SSE) |
-| `src/schemas.py` | Pydantic models: `StoryState`, `CharacterProfile`, `DialogueTurn`, `Action` |
-| `src/config.py` | Configuration: turns, temperature, model settings |
-| `src/actions.py` | Open-ended action validation + pattern-based execution + world-state updates |
-| `src/story_state.py` | StoryStateManager — initializes characters, memory, goals, inventory |
-| `src/graph/narrative_graph.py` | LangGraph workflow: director → character → reviewer → conclusion loop, twist injection |
-| `src/agents/base_agent.py` | BaseAgent with LLM integration (Google GenAI) + prompt/response logging |
-| `src/agents/character_agent.py` | CharacterAgent — structured JSON reasoning + dialogue + action |
-| `src/agents/director_agent.py` | DirectorAgent — speaker selection, twist generation, conclusion checking |
-| `src/agents/reviewer_agent.py` | ReviewerAgent — Karachi realism, language, repetition, action logic checks |
-| `scenarios/<id>/scenario.json` | Everything the LLM sees for one story: seed + setting, characters (persona, English style, appeals, reviewer notes, voice, image), Director/Reviewer/character prompt templates, and story settings. Edit it from the admin panel at `/admin`. |
-| `src/scenarios.py` | Loads, validates (placeholders, settings) and saves scenarios |
-| `src/prompts/character_prompts.py` | Builds a character's prompt from the scenario's templates |
-| `Hackthon_Frontend_IBA/frontend/` | React + Vite frontend for real-time story viewing |
+| `ERR_CONNECTION_REFUSED` / "Connection lost" in the browser | The API isn't running, or runs on another port. Start it, and make sure `frontend/.env` → `VITE_API_URL` matches the port. |
+| `[Errno 98] Address already in use` | Another program uses the port (e.g. Docker on 8080). Use `--port 8081` and set `VITE_API_URL=http://localhost:8081`. |
+| `429 RESOURCE_EXHAUSTED` | Gemini's daily free quota is used up for that model. Wait, add more fallback models, set up gpt-oss for the generator, or rely on saved stories. |
+| `503 UNAVAILABLE … high demand` | Google's servers are overloaded, which is temporary. Retries and fallbacks handle most cases; otherwise try again in a few minutes. |
+| Dialogue shows `...` | Every model in the chain failed for that turn (quota, overload, network). Such stories are never saved. |
+| Admin login returns 503 | `ADMIN_PASSWORD` is not set in `.env`. Set it and restart the API. |
+| Admin says "Not logged in" after a restart | The session expired or the password changed. Log in again. |
+| `[DB] Could not connect` | Check `DATABASE_URL`. Neon can take a moment to wake up; the app retries and reconnects later. |
+| Admin shows "read-only" / save returns 503 | The database isn't connected. Fix `DATABASE_URL` and restart the API. |
+| A run stays "running" | It's still generating (the timeline updates live). Runs interrupted by a restart are marked `aborted` on the next start. |
+| "The AI is unavailable … no saved story" | The LLM is down and nothing is saved for that scenario yet. Run a few stories while the key works. |
+| Listen / voice doesn't play | Edge TTS needs internet access. |
+| `ModuleNotFoundError: src` | Run commands from the repo root. |

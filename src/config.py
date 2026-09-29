@@ -35,6 +35,9 @@ class StoryConfig:
     # Full scenario dict: characters, personas, prompts (see src/scenarios.py)
     scenario: dict = field(default_factory=dict)
 
+    # RunRecorder (src/run_recorder.py) that saves every event / LLM call of this run; None = not recorded
+    recorder: object = None
+
     @classmethod
     def from_scenario(cls, scenario: dict, language: str = "urdu") -> "StoryConfig":
         s = scenario.get("settings", {})

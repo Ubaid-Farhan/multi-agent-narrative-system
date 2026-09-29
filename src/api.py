@@ -1,7 +1,7 @@
 """
-FastAPI server for the narrative system.
-POST /api/run: run full narrative once, store result, return frontend-shaped payload.
-GET /api/story: return last stored story (for refresh / load without re-run).
+FastAPI server for the narrative system: story player (SSE), TTS, replay fallback, admin panel API.
+Scenarios / characters / prompts / images live in the database (src/scenario_store.py) and every story
+run is recorded step by step (src/run_recorder.py).
 """
 import asyncio
 import base64
@@ -10,12 +10,13 @@ import hmac
 import io
 import json
 import os
-import re
-import secrets
-import shutil
 import sys
 import time
+import warnings
 from pathlib import Path
+
+# A harmless bug inside the Gemini client's error handling prints this on every failed call.
+warnings.filterwarnings("ignore", message="coroutine 'ClientResponse.json' was never awaited")
 
 current_dir = Path(__file__).parent
 project_root = current_dir.parent
@@ -37,7 +38,11 @@ from src.story_state import StoryStateManager
 from src import scenarios as scn
 from src import db
 from src import scenario_generator
-from src.agents.base_agent import BaseAgent
+from src import scenario_store as store
+from src import run_recorder
+from src.run_recorder import RunRecorder
+from src.import_data import run_imports
+from src.agents.base_agent import BaseAgent, LLMUnavailableError
 from contextlib import asynccontextmanager
 
 # In-memory store for the last run (frontend-shaped payload)
@@ -46,13 +51,26 @@ last_story: dict | None = None
 DEFAULT_VOICE_PROFILE = {"voice": "hi-IN-MadhurNeural", "rate": "+0%", "pitch": "+0Hz"}
 
 
-def _load_scenario_or_404(scenario_id: str) -> dict:
+def _http_error(e: Exception) -> HTTPException:
+    """Map storage errors to HTTP responses."""
+    if isinstance(e, HTTPException):
+        return e
+    if isinstance(e, store.ReadOnlyError):
+        return HTTPException(status_code=503, detail=str(e))
+    if isinstance(e, store.ScenarioExistsError):
+        return HTTPException(status_code=409, detail=str(e))
+    if isinstance(e, scn.ScenarioError):
+        return HTTPException(status_code=422, detail=str(e))
+    if isinstance(e, FileNotFoundError):
+        return HTTPException(status_code=404, detail=str(e))
+    return HTTPException(status_code=500, detail=str(e))
+
+
+async def _load_scenario_or_404(scenario_id: str) -> dict:
     try:
-        return scn.load_scenario(scenario_id)
-    except scn.ScenarioError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except FileNotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e))
+        return await store.load_scenario(scenario_id)
+    except Exception as e:
+        raise _http_error(e)
 
 
 def events_to_frontend_turns(events: list, seed_story: dict, conclusion_reason: str | None,
@@ -112,11 +130,11 @@ def events_to_frontend_turns(events: list, seed_story: dict, conclusion_reason: 
     }
 
 
-def _build_story(scenario_id: str, language: str):
+def _build_story(scenario: dict, language: str, recorder: RunRecorder | None = None):
     """Build agents + graph for a scenario. Returns (scenario, seed_story, story_graph, story_manager, agents)."""
-    scenario = _load_scenario_or_404(scenario_id)
     seed_story = {k: scenario.get(k) for k in ("title", "description", "setting")}
     config = StoryConfig.from_scenario(scenario, language=language)
+    config.recorder = recorder
     characters = [CharacterAgent(name=char["name"], config=config) for char in scenario["characters"]]
     director = DirectorAgent(config)
     reviewer = ReviewerAgent(config)
@@ -129,10 +147,10 @@ def _speaker_keys(scenario: dict) -> dict:
     return {c["name"]: c["key"] for c in scenario.get("characters", [])}
 
 
-async def run_narrative(scenario_id: str, language: str = "urdu"):
+async def run_narrative(scenario: dict, language: str = "urdu", recorder: RunRecorder | None = None):
     """Run the full narrative. Returns (final_state, scenario, seed_story, director, reviewer, characters)."""
     scenario, seed_story, story_graph, story_manager, (director, reviewer, characters) = \
-        _build_story(scenario_id, language)
+        _build_story(scenario, language, recorder)
     final_state = await story_graph.run(
         seed_story=seed_story,
         character_profiles=story_manager.state.character_profiles,
@@ -141,9 +159,9 @@ async def run_narrative(scenario_id: str, language: str = "urdu"):
     return final_state, scenario, seed_story, director, reviewer, characters
 
 
-def _build_graph_and_state(scenario_id: str, language: str = "urdu"):
+def _build_graph_and_state(scenario: dict, language: str = "urdu", recorder: RunRecorder | None = None):
     """Build narrative graph and initial state (for streaming). Returns (scenario, seed_story, story_graph, initial_state)."""
-    scenario, seed_story, story_graph, story_manager, _ = _build_story(scenario_id, language)
+    scenario, seed_story, story_graph, story_manager, _ = _build_story(scenario, language, recorder)
     initial_state = StoryState(
         seed_story=seed_story,
         character_profiles=story_manager.state.character_profiles,
@@ -153,48 +171,83 @@ def _build_graph_and_state(scenario_id: str, language: str = "urdu"):
     return scenario, seed_story, story_graph, initial_state
 
 
+def _action_count(turns: list) -> int:
+    return sum(1 for t in turns if t.get("actionText"))
+
+
+def _state_dict(state) -> dict:
+    """A graph state (pydantic model or dict) as plain JSON-able data."""
+    if isinstance(state, StoryState):
+        return state.model_dump(mode="json")
+    return StoryState.model_validate(state).model_dump(mode="json")
+
+
 async def run_narrative_stream(scenario: dict, seed_story: dict, story_graph: NarrativeGraph,
-                               initial_state: StoryState, language: str = "urdu"):
+                               initial_state: StoryState, language: str = "urdu",
+                               recorder: RunRecorder | None = None, previous_turns: list | None = None):
     """
-    Stream graph steps; after each character_respond we have new events.
-    Yields SSE payloads: meta, newTurns (per turn), conclusion, done.
+    Stream the story; yields SSE payloads: meta, turns (newTurns), conclusion, done (or error).
+    After every turn the run is checkpointed (turns + full state), so an unfinished run can be continued.
+    `previous_turns`: turns already shown when continuing a run; they are sent first.
     """
     global last_story
     title = seed_story.get("title", "")
     description = seed_story.get("description", "")
     speaker_keys = _speaker_keys(scenario)
-    yield f"data: {json.dumps({'type': 'meta', 'title': title, 'scenario': description, 'scenarioId': scenario['id'], 'source': 'live'})}\n\n"
-    try:
-        stream = story_graph.graph.astream(initial_state, stream_mode="updates")
-    except TypeError:
-        stream = story_graph.graph.astream(initial_state)
-    turns_sent = 0
-    all_turns = []
+    run_id = recorder.run_id if recorder else None
+    resumed = bool(previous_turns)
+    yield f"data: {json.dumps({'type': 'meta', 'title': title, 'scenario': description, 'scenarioId': scenario['id'], 'source': 'live', 'runId': run_id, 'resumed': resumed})}\n\n"
+
+    all_turns = list(previous_turns or [])
+    if all_turns:
+        yield f"data: {json.dumps({'type': 'turns', 'newTurns': all_turns})}\n\n"
+    turns_sent = len(all_turns)
     conclusion_reason = ""
-    async for chunk in stream:
-        if not isinstance(chunk, dict):
-            continue
-        for node_name, state_update in chunk.items():
-            if node_name == "character_respond":
-                events = state_update.get("events", []) if isinstance(state_update, dict) else getattr(state_update, "events", [])
-                if not events:
-                    continue
-                payload = events_to_frontend_turns(events, seed_story, None, speaker_keys)
-                new_turns = payload["turns"][turns_sent:]
-                if new_turns:
-                    turns_sent = len(payload["turns"])
-                    all_turns.extend(new_turns)
-                    yield f"data: {json.dumps({'type': 'turns', 'newTurns': new_turns})}\n\n"
-            elif node_name == "check_conclusion":
-                if (state_update.get("is_concluded") if isinstance(state_update, dict) else getattr(state_update, "is_concluded", False)):
-                    conclusion_reason = state_update.get("conclusion_reason", "") if isinstance(state_update, dict) else getattr(state_update, "conclusion_reason", "") or ""
-                    yield f"data: {json.dumps({'type': 'conclusion', 'conclusion': conclusion_reason})}\n\n"
-            elif node_name == "conclude":
-                pass  # conclusion_reason already sent from check_conclusion
-    last_story = {"title": title, "scenario": description, "scenarioId": scenario["id"],
-                  "turns": all_turns, "conclusion": conclusion_reason}
-    await db.save_story(scenario["id"], language, last_story)
-    yield f"data: {json.dumps({'type': 'done'})}\n\n"
+    status, error = "aborted", None
+    try:
+        async for state in story_graph.graph.astream(initial_state, stream_mode="values"):
+            data = state.model_dump() if isinstance(state, StoryState) else state
+            events = data.get("events") or []
+            payload = events_to_frontend_turns(events, seed_story, None, speaker_keys)
+            new_turns = payload["turns"][turns_sent:]
+            if new_turns:
+                turns_sent = len(payload["turns"])
+                all_turns.extend(new_turns)
+                if recorder:
+                    recorder.checkpoint(all_turns, _state_dict(state), _action_count(all_turns))
+                yield f"data: {json.dumps({'type': 'turns', 'newTurns': new_turns})}\n\n"
+            if data.get("is_concluded") and not conclusion_reason:
+                conclusion_reason = data.get("conclusion_reason") or ""
+                yield f"data: {json.dumps({'type': 'conclusion', 'conclusion': conclusion_reason})}\n\n"
+        status = "completed" if db.is_complete(all_turns, conclusion_reason) else "incomplete"
+    except LLMUnavailableError as e:
+        status, error = "failed", f"No AI model could answer ({e})"
+        print(f"[Story] Stopped: {error}")
+    except Exception as e:
+        status, error = "failed", str(e) or e.__class__.__name__
+        print(f"[Story] Run failed: {e!r}")
+        if recorder:
+            recorder.event("error", content="Story run failed", error=error)
+    finally:
+        last_story = {"title": title, "scenario": description, "scenarioId": scenario["id"],
+                      "turns": all_turns, "conclusion": conclusion_reason}
+        if recorder:
+            try:
+                await asyncio.shield(recorder.finish(status, turns=all_turns, conclusion=conclusion_reason,
+                                                     error=error, turn_count=len(all_turns),
+                                                     action_count=_action_count(all_turns)))
+            except BaseException:
+                pass  # viewer left mid-save; the shielded save still completes
+    if status == "failed":
+        saved_note = f" Run #{run_id} is saved — press Continue later to pick up from turn {len(all_turns)}." \
+            if run_id and all_turns else ""
+        if error and error.startswith("No AI model"):
+            message = (f"The story stopped after {len(all_turns)} turn(s): the AI is unavailable right now "
+                       "(daily quota used up or the service is busy)." + saved_note)
+        else:
+            message = "The story stopped because of an error: " + (error or "")[:300] + saved_note
+        yield f"data: {json.dumps({'type': 'error', 'message': message, 'turns': len(all_turns), 'runId': run_id})}\n\n"
+    yield f"data: {json.dumps({'type': 'done', 'runId': run_id})}\n\n"
 
 
 # ─────────────────────────────── LLM availability + replay ───────────────────────────────
@@ -214,10 +267,10 @@ async def llm_available(scenario: dict, language: str) -> bool:
         print("[LLM] No API key configured.")
         return False
     try:
-        llm = BaseAgent._build_llm(StoryConfig.from_scenario(scenario, language=language))
-        response = await asyncio.wait_for(llm.ainvoke([("human", "Reply with the word OK.")]), LLM_CHECK_TIMEOUT)
-        if not (response.text if isinstance(response.content, list) else response.content).strip():
-            raise ValueError("empty response")
+        # Same model order and cooldowns as a real story: models known to be out of quota are skipped.
+        probe = BaseAgent("Health check", StoryConfig.from_scenario(scenario, language=language))
+        probe.max_wait = 0
+        await asyncio.wait_for(probe.generate_response("Reply with the word OK."), LLM_CHECK_TIMEOUT)
     except Exception as e:
         print(f"[LLM] Unavailable ({str(e)[:120]}) — will replay a saved story.")
         return False
@@ -226,9 +279,9 @@ async def llm_available(scenario: dict, language: str) -> bool:
 
 
 async def replay_story_stream(scenario: dict, saved: dict):
-    """Stream a saved story exactly as it was generated, turn by turn."""
+    """Stream a saved run exactly as it was generated, turn by turn."""
     global last_story
-    yield f"data: {json.dumps({'type': 'meta', 'title': saved['title'], 'scenario': saved['scenario'], 'scenarioId': scenario['id'], 'source': 'saved', 'storyId': saved['id']})}\n\n"
+    yield f"data: {json.dumps({'type': 'meta', 'title': saved['title'], 'scenario': saved['scenario'], 'scenarioId': scenario['id'], 'source': 'saved', 'runId': saved['id']})}\n\n"
     for turn in saved["turns"]:
         await asyncio.sleep(REPLAY_TURN_DELAY)
         yield f"data: {json.dumps({'type': 'turns', 'newTurns': [turn]})}\n\n"
@@ -243,10 +296,38 @@ async def error_stream(message: str):
     yield f"data: {json.dumps({'type': 'error', 'message': message})}\n\n"
 
 
+async def _startup_maintenance() -> None:
+    """Import file scenarios / old stories, close runs cut off by a restart, prune old LLM logs."""
+    try:
+        await run_imports()
+        stale = await run_recorder.close_stale_runs()
+        pruned = await run_recorder.cleanup_llm_calls()
+        if stale or pruned:
+            print(f"[DB] Closed {stale} interrupted run(s); deleted {pruned} LLM log row(s) older than "
+                  f"{run_recorder.LLM_LOG_RETENTION_DAYS} days.")
+    except Exception as e:
+        print(f"[DB] Startup maintenance failed: {e!r}")
+
+
+async def _daily_cleanup() -> None:
+    while True:
+        await asyncio.sleep(24 * 60 * 60)
+        try:
+            await run_recorder.cleanup_llm_calls()
+        except Exception as e:
+            print(f"[DB] LLM log cleanup failed: {e!r}")
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     await db.init_db()
+    cleanup_task = None
+    if db.enabled():
+        await _startup_maintenance()
+        cleanup_task = asyncio.create_task(_daily_cleanup())
     yield
+    if cleanup_task:
+        cleanup_task.cancel()
     await db.close_db()
 
 
@@ -265,7 +346,7 @@ app.add_middleware(
 async def api_tts(text: str, speaker: str = "", scenario: str = scn.DEFAULT_SCENARIO_ID):
     """Generate TTS with the character's voice profile (pitch + rate) from the scenario."""
     try:
-        char = scn.get_character(scn.load_scenario(scenario), speaker)
+        char = scn.get_character(await store.load_scenario(scenario), speaker)
     except (scn.ScenarioError, FileNotFoundError):
         char = {}
     profile = {**DEFAULT_VOICE_PROFILE, **(char.get("voice") or {})}
@@ -306,20 +387,26 @@ def get_story():
 async def api_run(lang: str = "urdu", scenario: str = scn.DEFAULT_SCENARIO_ID):
     """Run the full narrative once, store result, return frontend-shaped payload."""
     global last_story
+    scenario_data = await _load_scenario_or_404(scenario)
+    recorder = RunRecorder(scenario_data, lang, source="api")
+    await recorder.start()
     try:
         final_state, scenario_data, seed_story, director, reviewer, characters = \
-            await run_narrative(scenario, language=lang)
-    except HTTPException:
-        raise
+            await run_narrative(scenario_data, language=lang, recorder=recorder)
     except Exception as e:
+        recorder.event("error", content="Story run failed", error=str(e))
+        await recorder.finish("failed", error=str(e))
         raise HTTPException(status_code=500, detail=str(e))
 
     events = final_state.get("events", [])
     conclusion_reason = final_state.get("conclusion_reason")
     payload = events_to_frontend_turns(events, seed_story, conclusion_reason, _speaker_keys(scenario_data))
     payload["scenarioId"] = scenario_data["id"]
+    payload["runId"] = recorder.run_id
     last_story = payload
-    await db.save_story(scenario_data["id"], lang, payload)
+    await recorder.finish("completed" if db.is_complete(payload["turns"], conclusion_reason or "") else "incomplete",
+                          turns=payload["turns"], conclusion=conclusion_reason or "",
+                          turn_count=len(payload["turns"]), action_count=_action_count(payload["turns"]))
 
     # Optionally write files (same as main.py) for consistency
     output_path = project_root / "story_output.json"
@@ -356,57 +443,122 @@ async def api_run(lang: str = "urdu", scenario: str = scn.DEFAULT_SCENARIO_ID):
 
 
 @app.get("/api/run/stream")
-async def api_run_stream(lang: str = "urdu", scenario: str = scn.DEFAULT_SCENARIO_ID, mode: str = "auto"):
+async def api_run_stream(lang: str = "urdu", scenario: str = scn.DEFAULT_SCENARIO_ID, mode: str = "auto",
+                         continue_run: int | None = None):
     """
     Stream a story as SSE. Events: meta (title, scenario, source), turns (newTurns), conclusion, done, error.
     mode=auto: generate live if the LLM responds, otherwise replay a saved story.
     mode=live: always generate. mode=saved: always replay a saved story.
+    continue_run=<run id>: continue an unfinished run from its last saved turn (same run number).
     """
     headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+    if continue_run is not None:
+        return await _continue_run_stream(continue_run, headers)
     if mode not in ("auto", "live", "saved"):
         raise HTTPException(status_code=422, detail="mode must be auto, live or saved")
-    scenario_data = _load_scenario_or_404(scenario)
+    scenario_data = await _load_scenario_or_404(scenario)
 
     if mode == "saved" or (mode == "auto" and not await llm_available(scenario_data, lang)):
-        saved = await db.pick_story(scenario_data["id"], lang)
+        saved = await run_recorder.pick_replay(scenario_data["id"], lang)
         if saved:
-            print(f"[Replay] Serving saved story #{saved['id']} ({saved['language']})")
+            print(f"[Replay] Serving saved run #{saved['id']} ({saved['language']})")
             return StreamingResponse(replay_story_stream(scenario_data, saved),
                                      media_type="text/event-stream", headers=headers)
         message = ("The AI is unavailable right now (API key failed or quota exhausted) and there is no "
                    "saved story for this scenario yet. Please try again later.")
         return StreamingResponse(error_stream(message), media_type="text/event-stream", headers=headers)
 
+    recorder = RunRecorder(scenario_data, lang, source="api")
+    await recorder.start()
     try:
-        scenario_data, seed_story, story_graph, initial_state = _build_graph_and_state(scenario, language=lang)
-    except HTTPException:
-        raise
+        scenario_data, seed_story, story_graph, initial_state = _build_graph_and_state(scenario_data, lang, recorder)
     except Exception as e:
+        await recorder.finish("failed", error=str(e))
         raise HTTPException(status_code=500, detail=str(e))
     return StreamingResponse(
-        run_narrative_stream(scenario_data, seed_story, story_graph, initial_state, lang),
+        run_narrative_stream(scenario_data, seed_story, story_graph, initial_state, lang, recorder),
         media_type="text/event-stream",
         headers=headers,
     )
 
 
+async def _continue_run_stream(run_id: int, headers: dict):
+    """Pick an unfinished run back up: same memories, world state and run number; the AI writes on."""
+    run = await run_recorder.library_run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"Run #{run_id} not found")
+    if not run["can_continue"]:
+        raise HTTPException(status_code=409, detail=f"Run #{run_id} cannot be continued (finished, running, "
+                                                    "or saved before continuing was possible)")
+    scenario_data = await _load_scenario_or_404(run["scenario_id"])
+    language = run["language"]
+    if not await llm_available(scenario_data, language):
+        message = (f"The AI is unavailable right now (daily quota used up or the service is busy), so run #{run_id} "
+                   "can't be continued yet. It stays saved — try Continue again later.")
+        return StreamingResponse(error_stream(message), media_type="text/event-stream", headers=headers)
+    recorder = await RunRecorder.resume(run_id, scenario_data)
+    if recorder is None:
+        raise HTTPException(status_code=409, detail=f"Run #{run_id} is already running or cannot be continued")
+    try:
+        scenario_data, seed_story, story_graph, _, _ = _build_story(scenario_data, language, recorder)
+        initial_state = StoryState.model_validate(recorder.saved["state"])
+    except Exception as e:
+        await recorder.finish("failed", turns=recorder.saved["turns"], error=f"Could not continue: {e}",
+                              turn_count=len(recorder.saved["turns"]))
+        raise HTTPException(status_code=500, detail=f"Could not continue run #{run_id}: {e}")
+    return StreamingResponse(
+        run_narrative_stream(scenario_data, seed_story, story_graph, initial_state, language, recorder,
+                             previous_turns=recorder.saved["turns"]),
+        media_type="text/event-stream",
+        headers=headers,
+    )
+
+
+# ─────────────────────────────── Saved runs (player library) ───────────────────────────────
+
+@app.get("/api/runs")
+async def api_library(scenario: str | None = None, continuable: bool = False, limit: int = 50, offset: int = 0):
+    """Saved runs for the player: every run with at least one turn, newest first. continuable=true → only unfinished."""
+    return await run_recorder.library(scenario, continuable, limit, offset)
+
+
+@app.get("/api/runs/{run_id}")
+async def api_library_run(run_id: int):
+    """One saved run (turns + ending) to play in the player."""
+    run = await run_recorder.library_run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"Run #{run_id} not found")
+    return run
+
+
 # ─────────────────────────────── Scenarios (public) ───────────────────────────────
 
 @app.get("/api/scenarios")
-def api_list_scenarios():
+async def api_list_scenarios():
     """List available scenarios for the story player."""
-    return {"scenarios": scn.list_scenarios(), "default": scn.DEFAULT_SCENARIO_ID}
+    return {"scenarios": await store.list_scenarios(), "default": scn.DEFAULT_SCENARIO_ID}
 
 
 @app.get("/api/scenarios/{scenario_id}")
-def api_get_scenario_public(scenario_id: str):
+async def api_get_scenario_public(scenario_id: str):
     """Scenario info for the story player (characters, images, colors) — no prompts."""
-    return scn.public_view(_load_scenario_or_404(scenario_id))
+    return scn.public_view(await _load_scenario_or_404(scenario_id))
+
+
+@app.get("/api/images/{image_id}")
+async def api_image(image_id: str):
+    """An image stored in the database (uploaded from the admin panel or imported)."""
+    found = await store.get_image(image_id)
+    if not found:
+        raise HTTPException(status_code=404, detail="Image not found")
+    data, content_type = found
+    return Response(content=data, media_type=content_type,
+                    headers={"Cache-Control": "public, max-age=31536000, immutable"})
 
 
 @app.get("/api/scenarios/{scenario_id}/images/{filename}")
 def api_scenario_image(scenario_id: str, filename: str):
-    """Serve an image uploaded from the admin panel."""
+    """Legacy: an image file in scenarios/<id>/images/ (new uploads are stored in the database)."""
     try:
         images_dir = (scn.scenario_dir(scenario_id) / "images").resolve()
     except scn.ScenarioError as e:
@@ -456,20 +608,23 @@ def api_admin_login(payload: dict = Body(...)):
 
 
 @app.get("/api/admin/meta", dependencies=[Depends(require_admin)])
-def api_admin_meta():
-    """Editor helpers: placeholders per prompt, TTS voices, colors, default settings."""
+async def api_admin_meta():
+    """Editor helpers: placeholders per prompt, TTS voices, colors, default settings, database status."""
     return {
         "prompts": scn.PROMPT_PLACEHOLDERS,
         "voices": scn.TTS_VOICES,
         "colors": scn.CHARACTER_COLORS,
         "default_settings": scn.DEFAULT_SETTINGS,
+        "database": await db.ensure(),
+        "llm_log": {"enabled": run_recorder.LLM_LOG_ENABLED, "retention_days": run_recorder.LLM_LOG_RETENTION_DAYS},
     }
 
 
 @app.get("/api/admin/scenarios", dependencies=[Depends(require_admin)])
-def api_admin_list_scenarios():
+async def api_admin_list_scenarios():
     """All scenarios including drafts (the public list hides drafts)."""
-    return {"scenarios": scn.list_scenarios(include_drafts=True), "default": scn.DEFAULT_SCENARIO_ID}
+    return {"scenarios": await store.list_scenarios(include_drafts=True), "default": scn.DEFAULT_SCENARIO_ID,
+            "writable": store.writable()}
 
 
 @app.post("/api/admin/scenarios/generate", dependencies=[Depends(require_admin)])
@@ -478,6 +633,8 @@ async def api_admin_generate_scenario(payload: dict = Body(...)):
     "New with AI": stream progress while the model writes a full scenario from a short idea.
     Events: progress {message}, done {id, title, warnings}, error {message}. Saved as a draft.
     """
+    if not await db.ensure():
+        raise _http_error(store.ReadOnlyError())
     brief = str(payload.get("brief", ""))
     try:
         num_characters = int(payload.get("num_characters", 4))
@@ -489,8 +646,8 @@ async def api_admin_generate_scenario(payload: dict = Body(...)):
             async for event in scenario_generator.generate_scenario(brief, num_characters):
                 if event["type"] == "done":
                     scenario = event["scenario"]
-                    new_id = scn.unique_id(scenario["title"])
-                    scn.save_scenario(new_id, scenario)
+                    new_id = await store.unique_id(scenario["title"])
+                    await store.save_scenario(new_id, scenario, note="Generated with AI", create=True)
                     print(f"[Generator] Saved draft scenario '{new_id}'")
                     yield f"data: {json.dumps({'type': 'done', 'id': new_id, 'title': scenario['title'], 'warnings': event['warnings']})}\n\n"
                 else:
@@ -503,64 +660,91 @@ async def api_admin_generate_scenario(payload: dict = Body(...)):
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
+@app.post("/api/admin/scenarios/import", dependencies=[Depends(require_admin)])
+async def api_admin_import_scenario(payload: dict = Body(...)):
+    """Import a scenario exported from this admin panel (or a plain scenario.json) as a new scenario."""
+    try:
+        return await store.import_scenario(payload)
+    except Exception as e:
+        raise _http_error(e)
+
+
 @app.get("/api/admin/scenarios/{scenario_id}", dependencies=[Depends(require_admin)])
-def api_admin_get_scenario(scenario_id: str):
-    return _load_scenario_or_404(scenario_id)
+async def api_admin_get_scenario(scenario_id: str):
+    return await _load_scenario_or_404(scenario_id)
 
 
 @app.put("/api/admin/scenarios/{scenario_id}", dependencies=[Depends(require_admin)])
-def api_admin_save_scenario(scenario_id: str, payload: dict = Body(...)):
-    _load_scenario_or_404(scenario_id)
+async def api_admin_save_scenario(scenario_id: str, payload: dict = Body(...)):
     try:
-        return scn.save_scenario(scenario_id, payload)
-    except scn.ScenarioError as e:
-        raise HTTPException(status_code=422, detail=str(e))
+        return await store.save_scenario(scenario_id, payload)
+    except Exception as e:
+        raise _http_error(e)
 
 
 @app.post("/api/admin/scenarios", dependencies=[Depends(require_admin)])
-def api_admin_create_scenario(payload: dict = Body(...)):
+async def api_admin_create_scenario(payload: dict = Body(...)):
     """Create a scenario by copying an existing one (default: the built-in scenario)."""
     new_id = str(payload.get("id", "")).strip()
     source_id = payload.get("copy_from") or scn.DEFAULT_SCENARIO_ID
     try:
-        target = scn.scenario_dir(new_id)
-    except scn.ScenarioError as e:
-        raise HTTPException(status_code=422, detail=str(e))
-    if target.exists():
-        raise HTTPException(status_code=409, detail=f"Scenario '{new_id}' already exists")
-    data = _load_scenario_or_404(source_id)
-    data["title"] = str(payload.get("title") or f"{data.get('title', '')} (copy)").strip()
-    saved = scn.save_scenario(new_id, data)
-    source_images = scn.scenario_dir(source_id) / "images"
-    if source_images.is_dir():
-        shutil.copytree(source_images, target / "images")
-        prefix_old = f"/api/scenarios/{source_id}/images/"
-        prefix_new = f"/api/scenarios/{new_id}/images/"
-        for char in saved["characters"]:
-            if char.get("image", "").startswith(prefix_old):
-                char["image"] = prefix_new + char["image"][len(prefix_old):]
-        if saved.get("background_image", "").startswith(prefix_old):
-            saved["background_image"] = prefix_new + saved["background_image"][len(prefix_old):]
-        saved = scn.save_scenario(new_id, saved)
-    return saved
+        scn._check_id(new_id)
+        return await store.create_copy(new_id, source_id, payload.get("title"))
+    except Exception as e:
+        raise _http_error(e)
 
 
 @app.delete("/api/admin/scenarios/{scenario_id}", dependencies=[Depends(require_admin)])
-def api_admin_delete_scenario(scenario_id: str):
+async def api_admin_delete_scenario(scenario_id: str):
     if scenario_id == scn.DEFAULT_SCENARIO_ID:
         raise HTTPException(status_code=400, detail="The default scenario cannot be deleted.")
-    _load_scenario_or_404(scenario_id)
-    shutil.rmtree(scn.scenario_dir(scenario_id))
+    try:
+        await store.delete_scenario(scenario_id)
+    except Exception as e:
+        raise _http_error(e)
     return {"deleted": scenario_id}
 
 
+@app.get("/api/admin/scenarios/{scenario_id}/versions", dependencies=[Depends(require_admin)])
+async def api_admin_versions(scenario_id: str):
+    try:
+        return {"versions": await store.list_versions(scenario_id)}
+    except Exception as e:
+        raise _http_error(e)
+
+
+@app.get("/api/admin/scenarios/{scenario_id}/versions/{version}", dependencies=[Depends(require_admin)])
+async def api_admin_version(scenario_id: str, version: int):
+    try:
+        return await store.get_version(scenario_id, version)
+    except Exception as e:
+        raise _http_error(e)
+
+
+@app.post("/api/admin/scenarios/{scenario_id}/versions/{version}/restore", dependencies=[Depends(require_admin)])
+async def api_admin_restore_version(scenario_id: str, version: int):
+    try:
+        return await store.restore_version(scenario_id, version)
+    except Exception as e:
+        raise _http_error(e)
+
+
+@app.get("/api/admin/scenarios/{scenario_id}/export", dependencies=[Depends(require_admin)])
+async def api_admin_export_scenario(scenario_id: str):
+    try:
+        data = await store.export_scenario(scenario_id)
+    except Exception as e:
+        raise _http_error(e)
+    return Response(content=json.dumps(data, ensure_ascii=False, indent=2), media_type="application/json",
+                    headers={"Content-Disposition": f'attachment; filename="{scenario_id}.scenario.json"'})
+
+
 @app.post("/api/admin/scenarios/{scenario_id}/images", dependencies=[Depends(require_admin)])
-def api_admin_upload_image(scenario_id: str, payload: dict = Body(...)):
-    """Upload an image as base64 ({filename, data}). Returns the URL to store in the scenario."""
-    _load_scenario_or_404(scenario_id)
+async def api_admin_upload_image(scenario_id: str, payload: dict = Body(...)):
+    """Upload an image as base64 ({filename, data}); stored in the database. Returns the URL to use."""
+    await _load_scenario_or_404(scenario_id)
     filename = str(payload.get("filename", ""))
-    ext = Path(filename).suffix.lower()
-    if ext not in ALLOWED_IMAGE_TYPES:
+    if Path(filename).suffix.lower() not in ALLOWED_IMAGE_TYPES:
         raise HTTPException(status_code=422, detail="Only PNG, JPG or WEBP images are allowed.")
     data = str(payload.get("data", ""))
     if "," in data and data.startswith("data:"):
@@ -571,9 +755,58 @@ def api_admin_upload_image(scenario_id: str, payload: dict = Body(...)):
         raise HTTPException(status_code=422, detail="Image data is not valid base64.")
     if len(raw) > MAX_IMAGE_BYTES:
         raise HTTPException(status_code=413, detail="Image is larger than 5 MB.")
-    stem = re.sub(r"[^a-zA-Z0-9_-]+", "-", Path(filename).stem).strip("-")[:40] or "image"
-    name = f"{stem}-{secrets.token_hex(4)}{ext}"
-    images_dir = scn.scenario_dir(scenario_id) / "images"
-    images_dir.mkdir(parents=True, exist_ok=True)
-    (images_dir / name).write_bytes(raw)
-    return {"url": f"/api/scenarios/{scenario_id}/images/{name}"}
+    try:
+        return {"url": await store.save_image(scenario_id, filename, raw)}
+    except Exception as e:
+        raise _http_error(e)
+
+
+# ─────────────────────────────── Admin: story runs ───────────────────────────────
+
+async def _require_runs_db() -> None:
+    if not await db.ensure():
+        raise HTTPException(status_code=503, detail="The database is not connected — story runs are unavailable.")
+
+
+@app.get("/api/admin/runs", dependencies=[Depends(require_admin)])
+async def api_admin_runs(scenario: str | None = None, status: str | None = None, language: str | None = None,
+                         limit: int = 50, offset: int = 0):
+    """Recorded story runs, newest first."""
+    await _require_runs_db()
+    return await run_recorder.list_runs(scenario, status, language, limit, offset)
+
+
+@app.get("/api/admin/runs/{run_id}", dependencies=[Depends(require_admin)])
+async def api_admin_run(run_id: int):
+    """One run with every recorded event, in order."""
+    await _require_runs_db()
+    run = await run_recorder.get_run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"Run #{run_id} not found")
+    return run
+
+
+@app.get("/api/admin/runs/{run_id}/llm-calls", dependencies=[Depends(require_admin)])
+async def api_admin_run_llm_calls(run_id: int):
+    """Every prompt and response of a run (kept for LLM_LOG_RETENTION_DAYS)."""
+    await _require_runs_db()
+    return {"calls": await run_recorder.get_llm_calls(run_id)}
+
+
+@app.patch("/api/admin/runs/{run_id}", dependencies=[Depends(require_admin)])
+async def api_admin_update_run(run_id: int, payload: dict = Body(...)):
+    """Include or exclude a run from the offline replay pool."""
+    await _require_runs_db()
+    if "in_replay_pool" not in payload:
+        raise HTTPException(status_code=422, detail="Send {\"in_replay_pool\": true|false}")
+    if not await run_recorder.set_replay_pool(run_id, bool(payload["in_replay_pool"])):
+        raise HTTPException(status_code=404, detail=f"Run #{run_id} not found")
+    return await run_recorder.get_run(run_id)
+
+
+@app.delete("/api/admin/runs/{run_id}", dependencies=[Depends(require_admin)])
+async def api_admin_delete_run(run_id: int):
+    await _require_runs_db()
+    if not await run_recorder.delete_run(run_id):
+        raise HTTPException(status_code=404, detail=f"Run #{run_id} not found")
+    return {"deleted": run_id}
