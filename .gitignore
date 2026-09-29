@@ -146,3 +146,6 @@ node_modules/
 .superpowers/
 story_output.json
 prompts_log.json
+
+# Playwright MCP screenshots/logs
+.playwright-mcp/

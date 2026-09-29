@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import os
 from dotenv import load_dotenv
 
@@ -26,4 +26,23 @@ class StoryConfig:
     num_characters: int = 4
     max_dialogue_length: int = 250
     language: str = "urdu"  # "urdu" = Roman Urdu, "english" = English
+
+    # Story-shape settings (overridden per scenario from the admin panel)
+    twist_turn: int = 9
+    min_actions: int = 5
+    post_twist_turns: int = 5
+
+    # Full scenario dict: characters, personas, prompts (see src/scenarios.py)
+    scenario: dict = field(default_factory=dict)
+
+    @classmethod
+    def from_scenario(cls, scenario: dict, language: str = "urdu") -> "StoryConfig":
+        s = scenario.get("settings", {})
+        return cls(
+            language=language,
+            scenario=scenario,
+            num_characters=len(scenario.get("characters", [])),
+            **{k: s[k] for k in ("max_turns", "min_turns", "temperature", "max_dialogue_length",
+                                 "twist_turn", "min_actions", "post_twist_turns") if k in s},
+        )
     

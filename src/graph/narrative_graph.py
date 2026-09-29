@@ -8,12 +8,12 @@ from ..agents.director_agent import DirectorAgent
 from ..agents.reviewer_agent import ReviewerAgent
 from ..story_state import StoryStateManager
 from ..actions import validate_action, execute_action, get_action_count
-from ..prompts.character_prompts import CHARACTER_APPEALS
+from ..scenarios import get_character
 
 
-def _build_appeal_decay_text(character_name: str, dialogue_history) -> str:
+def _build_appeal_decay_text(character_name: str, dialogue_history, scenario: Dict) -> str:
     """Scan dialogue history and return appeal impact status for this character."""
-    appeals = CHARACTER_APPEALS.get(character_name)
+    appeals = get_character(scenario, character_name).get("appeals")
     if not appeals:
         return ""
 
@@ -79,7 +79,7 @@ class NarrativeGraph:
         return "\n".join(lines) if lines else "Nothing notable yet."
 
     async def _director_select_node(self, state: StoryState) -> Dict:
-        """Director selects the next speaker. Generates twist at turn 9 via LLM."""
+        """Director selects the next speaker. Generates a twist at config.twist_turn via LLM."""
         available = list(self.characters.keys())
 
         twist_narration = ""
@@ -87,8 +87,8 @@ class NarrativeGraph:
         updated_memories = dict(state.character_memories)
 
         # === DYNAMIC TWIST GENERATION ===
-        # At turn 9, ask the Director to generate a contextual twist
-        if state.current_turn == 9 and not state.world_state.get("_twist_injected"):
+        # At the configured turn, ask the Director to generate a contextual twist
+        if state.current_turn == self.config.twist_turn and not state.world_state.get("_twist_injected"):
             twist_data = await self.director.generate_twist(state)
 
             if twist_data:
@@ -186,7 +186,7 @@ class NarrativeGraph:
         else:
             used_actions_text = "None yet"
 
-        appeal_decay = _build_appeal_decay_text(character_name, state.dialogue_history)
+        appeal_decay = _build_appeal_decay_text(character_name, state.dialogue_history, self.config.scenario)
 
         return f"""Initial Event: {state.seed_story.get('description', 'Unknown event')}
 
@@ -332,17 +332,17 @@ Recent Dialogue:
         if state.current_turn < self.config.min_turns:
             return {"is_concluded": False}
 
-        # HARD BLOCK: Do not allow conclusion before 5 actions
-        if action_count < 5:
+        # HARD BLOCK: Do not allow conclusion before min_actions actions
+        if action_count < self.config.min_actions:
             return {"is_concluded": False}
 
-        # HARD BLOCK: After a twist is injected (turn 9), give at least 5 more turns
+        # HARD BLOCK: After a twist is injected, give at least post_twist_turns more turns
         twist_injected = state.world_state.get("_twist_injected")
-        if twist_injected and state.current_turn < 14:
+        if twist_injected and state.current_turn < self.config.twist_turn + self.config.post_twist_turns:
             return {"is_concluded": False}
 
         # Only check conclusion every OTHER turn after min_turns (prevents immediate ending)
-        if state.current_turn < 18 and state.current_turn % 2 != 0:
+        if state.current_turn < self.config.max_turns - 2 and state.current_turn % 2 != 0:
             return {"is_concluded": False}
 
         # Force conclusion at max_turns — generate proper narrative
@@ -350,7 +350,7 @@ Recent Dialogue:
             _, narration = await self.director.check_conclusion(state)
             return {
                 "is_concluded": True,
-                "conclusion_reason": narration or "Shahrah-e-Faisal dheere dheere apni aam zindagi mein wapis aa gaya. Bheed chhant gayi, aur rickshaw aur BMW dono apni raahon pe nikal gaye — jaise yeh sab hua hi nahi tha.",
+                "conclusion_reason": narration or self.config.scenario["prompts"]["fallback_conclusion"],
                 "events": state.events + ([{
                     "type": "narration",
                     "content": narration,
