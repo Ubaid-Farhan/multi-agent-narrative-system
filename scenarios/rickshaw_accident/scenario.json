@@ -14,7 +14,7 @@
       "car": "White BMW, dent on left rear door, blocking right lane"
     }
   },
-  "background_image": "/img12.png",
+  "background_image": "/api/scenarios/rickshaw_accident/images/IMG-20250627-WA0019-jpg-c5bedd5e.jpeg",
   "settings": {
     "max_turns": 20,
     "min_turns": 8,
