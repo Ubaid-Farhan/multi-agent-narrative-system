@@ -105,6 +105,42 @@ class RunRecorder:
         self._queue.put_nowait(LlmCall(run_id=self.run_id, agent=agent, model=model, prompt=prompt or "",
                                        response=response or "", ok=ok, error=error, latency_ms=latency_ms))
 
+    def checkpoint(self, turns: list, state: Dict, action_count: int = 0) -> None:
+        """Save the turns so far and the full story state (non-blocking), so the run can be continued later."""
+        if not self.active or self._finished:
+            return
+        self._queue.put_nowait({"checkpoint": {"turns": turns, "turn_count": len(turns),
+                                               "action_count": action_count, "state": _jsonable(state)}})
+
+    @classmethod
+    async def resume(cls, run_id: int, scenario: Dict) -> Optional["RunRecorder"]:
+        """Re-open an unfinished run so new events continue its numbering. None if it can't be continued."""
+        if not await db.ensure():
+            return None
+        async with db.session() as s, s.begin():
+            run = await s.get(StoryRun, run_id, with_for_update=True)
+            if run is None or run.state is None or run.status == "running":
+                return None
+            last_seq = (await s.execute(select(func.max(StoryEvent.seq)).where(StoryEvent.run_id == run_id))).scalar()
+            run.status = "running"
+            run.finished_at = None
+            run.error = None
+            run.in_replay_pool = False
+            run.resumed_count = (run.resumed_count or 0) + 1
+            rec = cls(scenario, run.language, source=run.source)
+            rec.run_id = run.id
+            rec._seq = last_seq or 0
+            rec.models_used = list(run.models_used or [])
+            rec.llm_call_count = run.llm_call_count or 0
+            rec.twist_turn = run.twist_turn
+            saved = {"state": run.state, "turns": list(run.turns or []), "title": run.title, "seed": run.seed}
+        rec.saved = saved
+        rec._queue = asyncio.Queue()
+        rec._worker = asyncio.create_task(rec._drain())
+        rec.event("resumed", turn=len(saved["turns"]), content=f"Continued from turn {len(saved['turns'])}")
+        print(f"[Recorder] Run #{run_id} continued from turn {len(saved['turns'])}")
+        return rec
+
     async def _drain(self) -> None:
         """Write queued rows in order, batching whatever has piled up."""
         while True:
@@ -120,10 +156,16 @@ class RunRecorder:
                     stop = True
                     break
                 batch.append(nxt)
+            rows = [item for item in batch if not isinstance(item, dict)]
+            checkpoints = [item["checkpoint"] for item in batch if isinstance(item, dict)]
             for attempt in range(3):  # a dropped connection is retried on a fresh one
                 try:
                     async with db.session() as s, s.begin():
-                        s.add_all([_copy_row(row) for row in batch])
+                        s.add_all([_copy_row(row) for row in rows])
+                        if checkpoints:  # only the newest one matters
+                            await s.execute(update(StoryRun).where(StoryRun.id == self.run_id).values(
+                                **checkpoints[-1], models_used=self.models_used,
+                                llm_call_count=self.llm_call_count, twist_turn=self.twist_turn))
                     break
                 except Exception as e:
                     if attempt == 2:
@@ -151,6 +193,7 @@ class RunRecorder:
             async with db.session() as s, s.begin():
                 await s.execute(update(StoryRun).where(StoryRun.id == self.run_id).values(
                     status=status, finished_at=datetime.now(timezone.utc), turns=turns, conclusion=conclusion or "",
+                    **({"state": None} if (conclusion or "").strip() else {}),
                     error=error, turn_count=turn_count, action_count=action_count, twist_turn=self.twist_turn,
                     models_used=self.models_used, llm_call_count=self.llm_call_count,
                     in_replay_pool=(status == "completed")))
@@ -217,6 +260,49 @@ async def pick_replay(scenario_id: str, language: str) -> Optional[Dict]:
     except Exception as e:
         print(f"[Replay] Could not load a saved run: {e!r}")
     return None
+
+
+# ─────────────────────────────── player library ───────────────────────────────
+
+RESUMABLE = (StoryRun.state.is_not(None), StoryRun.status != "running")
+
+
+def _library_item(run: StoryRun, can_continue: bool) -> Dict:
+    return {"id": run.id, "scenario_id": run.scenario_id, "title": run.title, "language": run.language,
+            "status": run.status, "turn_count": run.turn_count, "complete": run.status == "completed",
+            "can_continue": can_continue, "source": run.source,
+            "started_at": run.started_at.isoformat() if run.started_at else None,
+            "finished_at": run.finished_at.isoformat() if run.finished_at else None}
+
+
+async def library(scenario_id: Optional[str] = None, continuable_only: bool = False,
+                  limit: int = 50, offset: int = 0) -> Dict:
+    """Saved runs the player can play (any run with at least one turn) or continue."""
+    if not await db.ensure():
+        return {"runs": [], "total": 0}
+    can = (StoryRun.state.is_not(None) & (StoryRun.status != "running")).label("can_continue")
+    filters = [StoryRun.turn_count > 0]
+    if scenario_id:
+        filters.append(StoryRun.scenario_id == scenario_id)
+    if continuable_only:
+        filters.extend(RESUMABLE)
+    async with db.session() as s:
+        total = (await s.execute(select(func.count()).select_from(StoryRun).where(*filters))).scalar()
+        rows = (await s.execute(select(StoryRun, can).where(*filters).order_by(StoryRun.id.desc())
+                                .limit(min(max(limit, 1), 100)).offset(max(offset, 0)))).all()
+    return {"runs": [_library_item(run, bool(c)) for run, c in rows], "total": total}
+
+
+async def library_run(run_id: int) -> Optional[Dict]:
+    """One saved run in player shape (turns + ending)."""
+    if not await db.ensure():
+        return None
+    async with db.session() as s:
+        run = await s.get(StoryRun, run_id)
+        if run is None or not run.turns:
+            return None
+        item = _library_item(run, run.state is not None and run.status != "running")
+    return {**item, "scenario": run.seed, "turns": run.turns, "conclusion": run.conclusion}
 
 
 # ─────────────────────────────── admin queries ───────────────────────────────

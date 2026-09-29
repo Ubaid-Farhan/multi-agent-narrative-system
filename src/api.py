@@ -175,48 +175,50 @@ def _action_count(turns: list) -> int:
     return sum(1 for t in turns if t.get("actionText"))
 
 
+def _state_dict(state) -> dict:
+    """A graph state (pydantic model or dict) as plain JSON-able data."""
+    if isinstance(state, StoryState):
+        return state.model_dump(mode="json")
+    return StoryState.model_validate(state).model_dump(mode="json")
+
+
 async def run_narrative_stream(scenario: dict, seed_story: dict, story_graph: NarrativeGraph,
                                initial_state: StoryState, language: str = "urdu",
-                               recorder: RunRecorder | None = None):
+                               recorder: RunRecorder | None = None, previous_turns: list | None = None):
     """
-    Stream graph steps; after each character_respond we have new events.
-    Yields SSE payloads: meta, newTurns (per turn), conclusion, done (or error).
-    The run is recorded as it goes; if the viewer leaves, the run is closed as 'aborted'.
+    Stream the story; yields SSE payloads: meta, turns (newTurns), conclusion, done (or error).
+    After every turn the run is checkpointed (turns + full state), so an unfinished run can be continued.
+    `previous_turns`: turns already shown when continuing a run; they are sent first.
     """
     global last_story
     title = seed_story.get("title", "")
     description = seed_story.get("description", "")
     speaker_keys = _speaker_keys(scenario)
     run_id = recorder.run_id if recorder else None
-    yield f"data: {json.dumps({'type': 'meta', 'title': title, 'scenario': description, 'scenarioId': scenario['id'], 'source': 'live', 'runId': run_id})}\n\n"
+    resumed = bool(previous_turns)
+    yield f"data: {json.dumps({'type': 'meta', 'title': title, 'scenario': description, 'scenarioId': scenario['id'], 'source': 'live', 'runId': run_id, 'resumed': resumed})}\n\n"
 
-    turns_sent = 0
-    all_turns = []
+    all_turns = list(previous_turns or [])
+    if all_turns:
+        yield f"data: {json.dumps({'type': 'turns', 'newTurns': all_turns})}\n\n"
+    turns_sent = len(all_turns)
     conclusion_reason = ""
     status, error = "aborted", None
     try:
-        try:
-            stream = story_graph.graph.astream(initial_state, stream_mode="updates")
-        except TypeError:
-            stream = story_graph.graph.astream(initial_state)
-        async for chunk in stream:
-            if not isinstance(chunk, dict):
-                continue
-            for node_name, state_update in chunk.items():
-                if node_name == "character_respond":
-                    events = state_update.get("events", []) if isinstance(state_update, dict) else getattr(state_update, "events", [])
-                    if not events:
-                        continue
-                    payload = events_to_frontend_turns(events, seed_story, None, speaker_keys)
-                    new_turns = payload["turns"][turns_sent:]
-                    if new_turns:
-                        turns_sent = len(payload["turns"])
-                        all_turns.extend(new_turns)
-                        yield f"data: {json.dumps({'type': 'turns', 'newTurns': new_turns})}\n\n"
-                elif node_name == "check_conclusion":
-                    if (state_update.get("is_concluded") if isinstance(state_update, dict) else getattr(state_update, "is_concluded", False)):
-                        conclusion_reason = state_update.get("conclusion_reason", "") if isinstance(state_update, dict) else getattr(state_update, "conclusion_reason", "") or ""
-                        yield f"data: {json.dumps({'type': 'conclusion', 'conclusion': conclusion_reason})}\n\n"
+        async for state in story_graph.graph.astream(initial_state, stream_mode="values"):
+            data = state.model_dump() if isinstance(state, StoryState) else state
+            events = data.get("events") or []
+            payload = events_to_frontend_turns(events, seed_story, None, speaker_keys)
+            new_turns = payload["turns"][turns_sent:]
+            if new_turns:
+                turns_sent = len(payload["turns"])
+                all_turns.extend(new_turns)
+                if recorder:
+                    recorder.checkpoint(all_turns, _state_dict(state), _action_count(all_turns))
+                yield f"data: {json.dumps({'type': 'turns', 'newTurns': new_turns})}\n\n"
+            if data.get("is_concluded") and not conclusion_reason:
+                conclusion_reason = data.get("conclusion_reason") or ""
+                yield f"data: {json.dumps({'type': 'conclusion', 'conclusion': conclusion_reason})}\n\n"
         status = "completed" if db.is_complete(all_turns, conclusion_reason) else "incomplete"
     except LLMUnavailableError as e:
         status, error = "failed", f"No AI model could answer ({e})"
@@ -237,13 +239,14 @@ async def run_narrative_stream(scenario: dict, seed_story: dict, story_graph: Na
             except BaseException:
                 pass  # viewer left mid-save; the shielded save still completes
     if status == "failed":
+        saved_note = f" Run #{run_id} is saved — press Continue later to pick up from turn {len(all_turns)}." \
+            if run_id and all_turns else ""
         if error and error.startswith("No AI model"):
             message = (f"The story stopped after {len(all_turns)} turn(s): the AI is unavailable right now "
-                       "(daily quota used up or the service is busy). Start again later — if it is still down, "
-                       "a saved story will be played instead.")
+                       "(daily quota used up or the service is busy)." + saved_note)
         else:
-            message = "The story stopped because of an error: " + (error or "")[:300]
-        yield f"data: {json.dumps({'type': 'error', 'message': message, 'turns': len(all_turns)})}\n\n"
+            message = "The story stopped because of an error: " + (error or "")[:300] + saved_note
+        yield f"data: {json.dumps({'type': 'error', 'message': message, 'turns': len(all_turns), 'runId': run_id})}\n\n"
     yield f"data: {json.dumps({'type': 'done', 'runId': run_id})}\n\n"
 
 
@@ -440,13 +443,17 @@ async def api_run(lang: str = "urdu", scenario: str = scn.DEFAULT_SCENARIO_ID):
 
 
 @app.get("/api/run/stream")
-async def api_run_stream(lang: str = "urdu", scenario: str = scn.DEFAULT_SCENARIO_ID, mode: str = "auto"):
+async def api_run_stream(lang: str = "urdu", scenario: str = scn.DEFAULT_SCENARIO_ID, mode: str = "auto",
+                         continue_run: int | None = None):
     """
     Stream a story as SSE. Events: meta (title, scenario, source), turns (newTurns), conclusion, done, error.
     mode=auto: generate live if the LLM responds, otherwise replay a saved story.
     mode=live: always generate. mode=saved: always replay a saved story.
+    continue_run=<run id>: continue an unfinished run from its last saved turn (same run number).
     """
     headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+    if continue_run is not None:
+        return await _continue_run_stream(continue_run, headers)
     if mode not in ("auto", "live", "saved"):
         raise HTTPException(status_code=422, detail="mode must be auto, live or saved")
     scenario_data = await _load_scenario_or_404(scenario)
@@ -473,6 +480,55 @@ async def api_run_stream(lang: str = "urdu", scenario: str = scn.DEFAULT_SCENARI
         media_type="text/event-stream",
         headers=headers,
     )
+
+
+async def _continue_run_stream(run_id: int, headers: dict):
+    """Pick an unfinished run back up: same memories, world state and run number; the AI writes on."""
+    run = await run_recorder.library_run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"Run #{run_id} not found")
+    if not run["can_continue"]:
+        raise HTTPException(status_code=409, detail=f"Run #{run_id} cannot be continued (finished, running, "
+                                                    "or saved before continuing was possible)")
+    scenario_data = await _load_scenario_or_404(run["scenario_id"])
+    language = run["language"]
+    if not await llm_available(scenario_data, language):
+        message = (f"The AI is unavailable right now (daily quota used up or the service is busy), so run #{run_id} "
+                   "can't be continued yet. It stays saved — try Continue again later.")
+        return StreamingResponse(error_stream(message), media_type="text/event-stream", headers=headers)
+    recorder = await RunRecorder.resume(run_id, scenario_data)
+    if recorder is None:
+        raise HTTPException(status_code=409, detail=f"Run #{run_id} is already running or cannot be continued")
+    try:
+        scenario_data, seed_story, story_graph, _, _ = _build_story(scenario_data, language, recorder)
+        initial_state = StoryState.model_validate(recorder.saved["state"])
+    except Exception as e:
+        await recorder.finish("failed", turns=recorder.saved["turns"], error=f"Could not continue: {e}",
+                              turn_count=len(recorder.saved["turns"]))
+        raise HTTPException(status_code=500, detail=f"Could not continue run #{run_id}: {e}")
+    return StreamingResponse(
+        run_narrative_stream(scenario_data, seed_story, story_graph, initial_state, language, recorder,
+                             previous_turns=recorder.saved["turns"]),
+        media_type="text/event-stream",
+        headers=headers,
+    )
+
+
+# ─────────────────────────────── Saved runs (player library) ───────────────────────────────
+
+@app.get("/api/runs")
+async def api_library(scenario: str | None = None, continuable: bool = False, limit: int = 50, offset: int = 0):
+    """Saved runs for the player: every run with at least one turn, newest first. continuable=true → only unfinished."""
+    return await run_recorder.library(scenario, continuable, limit, offset)
+
+
+@app.get("/api/runs/{run_id}")
+async def api_library_run(run_id: int):
+    """One saved run (turns + ending) to play in the player."""
+    run = await run_recorder.library_run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"Run #{run_id} not found")
+    return run
 
 
 # ─────────────────────────────── Scenarios (public) ───────────────────────────────

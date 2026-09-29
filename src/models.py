@@ -134,6 +134,10 @@ class StoryRun(Base):
     times_served: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     last_served_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     source: Mapped[str] = mapped_column(String(16), default="api", nullable=False)  # api | cli | imported
+    # Full story state after the last saved turn (memories, world state, events…) so an unfinished run can be
+    # continued. Cleared once the story has an ending.
+    state: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    resumed_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
 
 
 class StoryEvent(Base):
