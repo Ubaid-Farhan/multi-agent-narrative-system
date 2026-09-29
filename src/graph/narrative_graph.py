@@ -7,7 +7,7 @@ from ..agents.character_agent import CharacterAgent
 from ..agents.director_agent import DirectorAgent
 from ..agents.reviewer_agent import ReviewerAgent
 from ..story_state import StoryStateManager
-from ..actions import validate_action, execute_action, get_action_count
+from ..actions import validate_action, execute_action, get_action_count, normalize_target
 from ..scenarios import get_character
 
 
@@ -41,6 +41,12 @@ class NarrativeGraph:
         self.director = director
         self.reviewer = reviewer
         self.graph = self._build_graph()
+
+    def _record(self, type: str, **kwargs) -> None:
+        """Save a step of this run (no-op when the run isn't being recorded)."""
+        recorder = getattr(self.config, "recorder", None)
+        if recorder:
+            recorder.event(type, **kwargs)
 
     def _build_graph(self) -> StateGraph:
         workflow = StateGraph(StoryState)
@@ -109,11 +115,16 @@ class NarrativeGraph:
                         char_mem = char_mem[-20:]
                     updated_memories[char_name] = char_mem
 
+                self._record("twist", turn=state.current_turn, content=twist_data.get("twist_narration", ""),
+                             world_state_updates=ws_updates, memory_update=memory_update)
+
                 print(f"\n{'='*60}")
                 print(f"STORY TWIST (Director-generated)")
                 print(f"{'='*60}\n")
 
         next_speaker, narration = await self.director.select_next_speaker(state, available)
+        self._record("director_narration", turn=state.current_turn + 1, content=narration or "",
+                     next_speaker=next_speaker, **self.director.last_selection)
 
         # Combine twist narration with director narration
         full_narration = twist_narration + narration if twist_narration else narration
@@ -229,19 +240,36 @@ Recent Dialogue:
         context = self._build_character_context(state, next_speaker)
         world_state_text = self._format_world_state(state)
 
+        turn_no = state.current_turn + 1
+
         # Get structured response (dialogue + optional action)
         dialogue, action = await character.respond(state, context, world_state_text)
+        attempt_meta = dict(character.last_meta)
+        retried = False
 
         # ReviewerAgent: check for Karachi realism, logical consistency, repetition
         if self.reviewer:
             approved, feedback = await self.reviewer.review_turn(
                 next_speaker, dialogue, action, state
             )
+            review = dict(self.reviewer.last_review)
             if not approved and feedback:
+                self._record("rejected_dialogue", turn=turn_no, speaker=next_speaker, content=dialogue,
+                             action=action, **attempt_meta)
+                self._record("review", turn=turn_no, speaker=next_speaker, content=feedback,
+                             reviewed_dialogue=dialogue, **review)
                 # Retry once with reviewer suggestion in context
                 context_retry = context + "\n\n=== REVIEWER FEEDBACK (you must address this) ===\n" + feedback
                 dialogue, action = await character.respond(state, context_retry, world_state_text)
+                attempt_meta = dict(character.last_meta)
+                retried = True
                 print(f"  [Reviewer] Retry used for {next_speaker}.")
+            else:
+                self._record("review", turn=turn_no, speaker=next_speaker, content="Approved",
+                             reviewed_dialogue=dialogue, **review)
+
+        self._record("dialogue", turn=turn_no, speaker=next_speaker, content=dialogue,
+                     retried_after_review=retried or None, **attempt_meta)
 
         print("********************************")
         print(f"{next_speaker}: {dialogue}")
@@ -273,7 +301,7 @@ Recent Dialogue:
         # Process action if present
         if action and isinstance(action, dict) and action.get("type"):
             action_type = action["type"]
-            target = action.get("target")
+            target = normalize_target(action.get("target"))
             description = action.get("description", "")
 
             is_valid, reason = validate_action(action_type, next_speaker, target, state)
@@ -298,8 +326,13 @@ Recent Dialogue:
                 })
 
                 print(f"  >> Action executed: {action_narration}")
+                self._record("action", turn=turn_no, speaker=next_speaker, content=action_narration,
+                             action_type=action_type, target=target, description=description, valid=True)
             else:
                 print(f"  >> Action rejected: {reason}")
+                self._record("action", turn=turn_no, speaker=next_speaker, content=description,
+                             action_type=action_type, target=target, description=description, valid=False,
+                             rejected_reason=reason)
 
         # Update dialogue memory for all characters
         speaker_mem = list(updated_memories.get(next_speaker, []))
@@ -315,6 +348,9 @@ Recent Dialogue:
                 if len(other_mem) > 20:
                     other_mem = other_mem[-20:]
                 updated_memories[char_name] = other_mem
+
+        self._record("world_state", turn=turn_no,
+                     state={k: v for k, v in updated_world.items()})
 
         return {
             "dialogue_history": state.dialogue_history + [new_turn],
@@ -348,6 +384,10 @@ Recent Dialogue:
         # Force conclusion at max_turns — generate proper narrative
         if state.current_turn >= self.config.max_turns:
             _, narration = await self.director.check_conclusion(state)
+            ending = narration or self.config.scenario["prompts"]["fallback_conclusion"]
+            self._record("conclusion", turn=state.current_turn, content=ending, trigger="max_turns reached",
+                         used_fallback_text=(not narration) or None,
+                         director_check=self.director.last_conclusion_check)
             return {
                 "is_concluded": True,
                 "conclusion_reason": narration or self.config.scenario["prompts"]["fallback_conclusion"],
@@ -360,8 +400,14 @@ Recent Dialogue:
             }
 
         should_end, reason = await self.director.check_conclusion(state)
+        self._record("conclusion_check", turn=state.current_turn,
+                     content=str(self.director.last_conclusion_check.get("reason") or ""),
+                     **self.director.last_conclusion_check)
 
         if should_end:
+            self._record("conclusion", turn=state.current_turn, content=str(reason or ""),
+                         trigger="Director decided the story is resolved",
+                         director_check=self.director.last_conclusion_check)
             events_update = []
             if reason:
                 events_update.append({

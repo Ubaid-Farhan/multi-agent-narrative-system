@@ -16,6 +16,7 @@ import copy
 import json
 import os
 import re
+import time
 from typing import AsyncIterator, Dict, List, Optional
 
 from dotenv import load_dotenv
@@ -23,6 +24,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_openai import ChatOpenAI
 
 from . import scenarios as scn
+from .run_recorder import log_llm_call
 
 load_dotenv()
 
@@ -167,8 +169,15 @@ async def _call(llm, sem: asyncio.Semaphore, user: str) -> str:
     for attempt in range(attempts):
         try:
             async with sem:
-                return _text(await llm.ainvoke([("system", DESIGNER_SYSTEM), ("human", user)]))
+                started = time.monotonic()
+                response = await llm.ainvoke([("system", DESIGNER_SYSTEM), ("human", user)])
+            text = _text(response)
+            meta = getattr(response, "response_metadata", None) or {}
+            await log_llm_call("Scenario generator", meta.get("model_name") or meta.get("model"), user, text, True,
+                               latency_ms=int((time.monotonic() - started) * 1000))
+            return text
         except Exception as e:
+            await log_llm_call("Scenario generator", None, user, "", False, error=str(e)[:2000])
             if attempt < attempts - 1 and any(t in str(e) for t in transient):
                 await asyncio.sleep(15 * (attempt + 1))
                 continue

@@ -11,6 +11,7 @@ class ReviewerAgent(BaseAgent):
 
     def __init__(self, config: StoryConfig):
         super().__init__("Reviewer", config)
+        self.last_review: Dict = {}  # verdict of the last review (saved with the run)
 
     async def review_turn(self, character_name: str, dialogue: str,
                           action: Optional[Dict], state: StoryState) -> Tuple[bool, str]:
@@ -21,6 +22,7 @@ class ReviewerAgent(BaseAgent):
             (approved: bool, feedback: str)
             If not approved, feedback contains the suggestion for regeneration.
         """
+        self.last_review = {}
         profile = state.character_profiles.get(character_name)
         character_description = profile.description if profile else "Unknown"
 
@@ -76,6 +78,8 @@ class ReviewerAgent(BaseAgent):
             issues = data.get("issues", [])
             severity = data.get("severity", "none")
             suggestion = data.get("suggestion", "")
+            self.last_review = {"approved": bool(approved), "severity": severity, "issues": issues,
+                                "suggestion": suggestion, "rejected": (not approved and severity == "major")}
 
             if not approved and severity == "major":
                 feedback = f"REJECTED: {'; '.join(issues)}. Suggestion: {suggestion}"
@@ -90,4 +94,6 @@ class ReviewerAgent(BaseAgent):
         except Exception as e:
             # If reviewer fails to parse, approve by default (don't block the story)
             print(f"  [Reviewer] Parse error: {e} — approving by default")
+            self.last_review = {"approved": True, "rejected": False, "parse_error": str(e),
+                                "note": "Reviewer output could not be read — approved by default"}
             return True, ""

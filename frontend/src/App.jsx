@@ -7,7 +7,9 @@ import './App.css';
 
 // Character picture, or a coloured initial when no image has been added yet (e.g. AI-generated scenarios).
 function CharacterPicture({ image, name, color, className, large = false }) {
-  if (image) return <img src={assetUrl(image)} alt={name} className={className} />;
+  // Falls back to initials if the image can't load (e.g. the database is offline).
+  const [failedSrc, setFailedSrc] = useState(null);
+  if (image && failedSrc !== image) return <img src={assetUrl(image)} alt={name} className={className} onError={() => setFailedSrc(image)} />;
   const initials = (name || '?').split(/\s+/).filter(Boolean).slice(0, 2).map((w) => w[0]).join('').toUpperCase();
   return (
     <div role="img" aria-label={name}
@@ -55,6 +57,7 @@ export default function Home() {
   const [displayedText, setDisplayedText] = useState('');
   const [isTyping, setIsTyping] = useState(false);
   const typingTimerRef = useRef(null);
+  const dialogueBodyRef = useRef(null);
   const audioRef = useRef(null);
   const isAutoPlayingRef = useRef(false);
 
@@ -149,6 +152,12 @@ export default function Home() {
     typingTimerRef.current = setTimeout(tick, 22);
     return () => clearTimeout(typingTimerRef.current);
   }, [showDialogue, currentTurn]);
+
+  // Keep the newest typed line in view when a long dialogue scrolls inside the bubble
+  useEffect(() => {
+    const el = dialogueBodyRef.current;
+    if (el && isTyping) el.scrollTop = el.scrollHeight;
+  }, [displayedText, isTyping]);
 
   const skipTyping = () => {
     if (isTyping && currentData?.dialogue) {
@@ -432,7 +441,7 @@ export default function Home() {
               animate={{ opacity: 1, x: 0 }}
               exit={{ opacity: 0, x: 50 }}
               transition={{ duration: 0.5 }}
-              className="absolute bottom-0 left-0 right-0 flex items-end justify-between p-4 md:p-8 z-10"
+              className="absolute top-20 md:top-24 bottom-0 left-0 right-0 flex items-end justify-between p-4 md:p-8 z-10"
             >
               {/* Phase 3-C: character nameplate moved below image */}
               <motion.div
@@ -460,16 +469,17 @@ export default function Home() {
                     animate={{ opacity: 1, scale: 1, y: 0 }}
                     exit={{ opacity: 0, scale: 0.8 }}
                     transition={{ duration: 0.4 }}
-                    className="flex-1 ml-4 md:ml-8 mb-8"
+                    className="flex-1 self-stretch min-h-0 flex flex-col justify-end ml-4 md:ml-8 mb-8"
                   >
                     {/* Phase 2-A: palette bubble + Phase 3-A: typewriter */}
+                    {/* max-h-full + scrolling body: long lines must not grow over the title */}
                     <div
-                      className="relative max-w-xl rounded-2xl overflow-hidden shadow-2xl"
+                      className="relative max-w-xl max-h-full flex flex-col rounded-2xl overflow-hidden shadow-2xl"
                       onClick={skipTyping}
                       style={{ cursor: isTyping ? 'pointer' : 'default' }}
                     >
                       {/* Character name header */}
-                      <div className={`px-4 py-2 bg-linear-to-r ${colorsOf(currentData.character).bg} flex items-center justify-between`}>
+                      <div className={`shrink-0 px-4 py-2 bg-linear-to-r ${colorsOf(currentData.character).bg} flex items-center justify-between`}>
                         <span className="text-white text-xs font-bold uppercase tracking-wider drop-shadow">
                           {currentData.speaker}
                         </span>
@@ -491,7 +501,10 @@ export default function Home() {
                         </button>
                       </div>
                       {/* Dialogue body */}
-                      <div className={`${colorsOf(currentData.character).bubble} border-2 border-t-0 rounded-b-2xl p-4 md:p-5`}>
+                      <div
+                        ref={dialogueBodyRef}
+                        className={`${colorsOf(currentData.character).bubble} border-2 border-t-0 rounded-b-2xl p-4 md:p-5 min-h-0 overflow-y-auto`}
+                      >
                         <p className={`text-sm md:text-base leading-relaxed ${colorsOf(currentData.character).text} min-h-[2em]`}>
                           {displayedText.split('\n').map((line, i, arr) => (
                             <span key={i}>

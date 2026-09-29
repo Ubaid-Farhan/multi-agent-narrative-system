@@ -10,16 +10,27 @@ from typing import Dict, List, Optional, Tuple
 from .schemas import StoryState
 
 
+_NO_TARGET = {"", "null", "none", "nil", "n/a", "na", "nobody", "no one", "self"}
+
+
+def normalize_target(target) -> Optional[str]:
+    """Models sometimes write the string "null" / "none" for no target — treat those as no target."""
+    if target is None:
+        return None
+    text = str(target).strip()
+    return None if text.lower() in _NO_TARGET else text
+
+
 def validate_action(action_type: str, actor: str, target: Optional[str],
                     state: StoryState) -> Tuple[bool, str]:
-    """Validate whether an action is allowed. Open-ended — any action type is valid."""
+    """
+    Validate whether an action is allowed. Open-ended — any action type is valid, and the target may be a
+    character or anything in the scene ("crowd", "counter", "rickshaw"…).
+    """
     if not action_type or not action_type.strip():
         return False, "Empty action type"
 
-    if target and target not in state.character_profiles:
-        return False, f"Unknown target: {target}"
-
-    if actor == target:
+    if target and actor == target:
         return False, "Cannot target yourself"
 
     return True, "Valid"

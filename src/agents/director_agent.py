@@ -9,6 +9,8 @@ from ..actions import get_action_count
 class DirectorAgent(BaseAgent):
     def __init__(self, config: StoryConfig):
         super().__init__("Director", config)
+        self.last_selection: Dict = {}   # who the model asked for vs. who was chosen (saved with the run)
+        self.last_conclusion_check: Dict = {}
         self.prompts = config.scenario["prompts"]
 
     def _format_world_state(self, state: StoryState) -> str:
@@ -70,8 +72,10 @@ class DirectorAgent(BaseAgent):
             data = json.loads(cleaned_response)
             next_speaker = data.get("next_speaker")
             narration = data.get("narration")
+            self.last_selection = {"requested": next_speaker}
 
             if next_speaker not in available_characters:
+                self.last_selection["override"] = f"'{next_speaker}' is not a character"
                 next_speaker = available_characters[0]
 
             # HARD ENFORCEMENT 1: prevent same speaker as last turn
@@ -83,6 +87,7 @@ class DirectorAgent(BaseAgent):
                     if alternatives:
                         forced = alternatives[0]
                         print(f"  [Anti-Repetition] Blocked {next_speaker} (spoke {max_consec}x in a row), forcing {forced}")
+                        self.last_selection["override"] = f"anti-repetition: {next_speaker} just spoke"
                         next_speaker = forced
 
             # HARD ENFORCEMENT 2: prevent same 2 characters ping-ponging for 4+ turns
@@ -94,11 +99,19 @@ class DirectorAgent(BaseAgent):
                     if alternatives:
                         forced = alternatives[0]
                         print(f"  [Anti-PingPong] Blocked 2-char loop ({unique_in_last_4}), forcing {forced}")
+                        self.last_selection["override"] = f"anti-ping-pong: {sorted(unique_in_last_4)} dominated 4 turns"
                         next_speaker = forced
 
+            self.last_selection["chosen"] = next_speaker
             return next_speaker, narration
 
         except Exception as e:
+            salvaged = self._salvage_fields(response, ["next_speaker", "narration"])
+            speaker = salvaged.get("next_speaker", "").rstrip("…")
+            if speaker in available_characters and salvaged.get("narration"):
+                self.last_selection = {"chosen": speaker, "requested": speaker, "parse_error": str(e), "salvaged": True}
+                return speaker, salvaged["narration"]
+            self.last_selection = {"chosen": available_characters[0], "parse_error": str(e)}
             print(f"Error parsing director selection: {e}")
             print(f"Raw response: {response}")
             return available_characters[0], ""
@@ -150,7 +163,10 @@ class DirectorAgent(BaseAgent):
         try:
             cleaned_response = self._clean_json_response(response)
             data = json.loads(cleaned_response)
+            self.last_conclusion_check = {"should_end": bool(data.get("should_end", False)),
+                                          "reason": data.get("reason")}
             return data.get("should_end", False), data.get("conclusion_narration")
         except Exception as e:
+            self.last_conclusion_check = {"should_end": False, "parse_error": str(e)}
             print(f"Error parsing director conclusion: {e}")
             return False, None
