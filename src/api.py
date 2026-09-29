@@ -35,6 +35,9 @@ from src.agents.reviewer_agent import ReviewerAgent
 from src.graph.narrative_graph import NarrativeGraph
 from src.story_state import StoryStateManager
 from src import scenarios as scn
+from src import db
+from src.agents.base_agent import BaseAgent
+from contextlib import asynccontextmanager
 
 # In-memory store for the last run (frontend-shaped payload)
 last_story: dict | None = None
@@ -150,7 +153,7 @@ def _build_graph_and_state(scenario_id: str, language: str = "urdu"):
 
 
 async def run_narrative_stream(scenario: dict, seed_story: dict, story_graph: NarrativeGraph,
-                               initial_state: StoryState):
+                               initial_state: StoryState, language: str = "urdu"):
     """
     Stream graph steps; after each character_respond we have new events.
     Yields SSE payloads: meta, newTurns (per turn), conclusion, done.
@@ -159,7 +162,7 @@ async def run_narrative_stream(scenario: dict, seed_story: dict, story_graph: Na
     title = seed_story.get("title", "")
     description = seed_story.get("description", "")
     speaker_keys = _speaker_keys(scenario)
-    yield f"data: {json.dumps({'type': 'meta', 'title': title, 'scenario': description, 'scenarioId': scenario['id']})}\n\n"
+    yield f"data: {json.dumps({'type': 'meta', 'title': title, 'scenario': description, 'scenarioId': scenario['id'], 'source': 'live'})}\n\n"
     try:
         stream = story_graph.graph.astream(initial_state, stream_mode="updates")
     except TypeError:
@@ -189,10 +192,64 @@ async def run_narrative_stream(scenario: dict, seed_story: dict, story_graph: Na
                 pass  # conclusion_reason already sent from check_conclusion
     last_story = {"title": title, "scenario": description, "scenarioId": scenario["id"],
                   "turns": all_turns, "conclusion": conclusion_reason}
+    await db.save_story(scenario["id"], language, last_story)
     yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
 
-app = FastAPI(title="AI Narrative Engine API")
+# ─────────────────────────────── LLM availability + replay ───────────────────────────────
+
+LLM_CHECK_TTL = 120          # seconds to trust a successful check
+LLM_CHECK_TIMEOUT = 30       # seconds before a check counts as failed
+REPLAY_TURN_DELAY = float(os.getenv("REPLAY_TURN_DELAY", "2.5"))  # pacing so a replay feels live
+_llm_ok_until = 0.0
+
+
+async def llm_available(scenario: dict, language: str) -> bool:
+    """One tiny call through the same model + fallback chain the story uses."""
+    global _llm_ok_until
+    if time.time() < _llm_ok_until:
+        return True
+    if not (os.getenv("GOOGLE_API_KEY") or os.getenv("OPENAI_API_KEY")):
+        print("[LLM] No API key configured.")
+        return False
+    try:
+        llm = BaseAgent._build_llm(StoryConfig.from_scenario(scenario, language=language))
+        response = await asyncio.wait_for(llm.ainvoke([("human", "Reply with the word OK.")]), LLM_CHECK_TIMEOUT)
+        if not (response.text if isinstance(response.content, list) else response.content).strip():
+            raise ValueError("empty response")
+    except Exception as e:
+        print(f"[LLM] Unavailable ({str(e)[:120]}) — will replay a saved story.")
+        return False
+    _llm_ok_until = time.time() + LLM_CHECK_TTL
+    return True
+
+
+async def replay_story_stream(scenario: dict, saved: dict):
+    """Stream a saved story exactly as it was generated, turn by turn."""
+    global last_story
+    yield f"data: {json.dumps({'type': 'meta', 'title': saved['title'], 'scenario': saved['scenario'], 'scenarioId': scenario['id'], 'source': 'saved', 'storyId': saved['id']})}\n\n"
+    for turn in saved["turns"]:
+        await asyncio.sleep(REPLAY_TURN_DELAY)
+        yield f"data: {json.dumps({'type': 'turns', 'newTurns': [turn]})}\n\n"
+    if saved.get("conclusion"):
+        yield f"data: {json.dumps({'type': 'conclusion', 'conclusion': saved['conclusion']})}\n\n"
+    last_story = {"title": saved["title"], "scenario": saved["scenario"], "scenarioId": scenario["id"],
+                  "turns": saved["turns"], "conclusion": saved.get("conclusion", "")}
+    yield f"data: {json.dumps({'type': 'done'})}\n\n"
+
+
+async def error_stream(message: str):
+    yield f"data: {json.dumps({'type': 'error', 'message': message})}\n\n"
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    await db.init_db()
+    yield
+    await db.close_db()
+
+
+app = FastAPI(title="AI Narrative Engine API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -261,6 +318,7 @@ async def api_run(lang: str = "urdu", scenario: str = scn.DEFAULT_SCENARIO_ID):
     payload = events_to_frontend_turns(events, seed_story, conclusion_reason, _speaker_keys(scenario_data))
     payload["scenarioId"] = scenario_data["id"]
     last_story = payload
+    await db.save_story(scenario_data["id"], lang, payload)
 
     # Optionally write files (same as main.py) for consistency
     output_path = project_root / "story_output.json"
@@ -297,11 +355,27 @@ async def api_run(lang: str = "urdu", scenario: str = scn.DEFAULT_SCENARIO_ID):
 
 
 @app.get("/api/run/stream")
-async def api_run_stream(lang: str = "urdu", scenario: str = scn.DEFAULT_SCENARIO_ID):
+async def api_run_stream(lang: str = "urdu", scenario: str = scn.DEFAULT_SCENARIO_ID, mode: str = "auto"):
     """
-    Run the narrative and stream each reviewed turn as SSE.
-    Events: meta (title, scenario), turns (newTurns), conclusion, done.
+    Stream a story as SSE. Events: meta (title, scenario, source), turns (newTurns), conclusion, done, error.
+    mode=auto: generate live if the LLM responds, otherwise replay a saved story.
+    mode=live: always generate. mode=saved: always replay a saved story.
     """
+    headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+    if mode not in ("auto", "live", "saved"):
+        raise HTTPException(status_code=422, detail="mode must be auto, live or saved")
+    scenario_data = _load_scenario_or_404(scenario)
+
+    if mode == "saved" or (mode == "auto" and not await llm_available(scenario_data, lang)):
+        saved = await db.pick_story(scenario_data["id"], lang)
+        if saved:
+            print(f"[Replay] Serving saved story #{saved['id']} ({saved['language']})")
+            return StreamingResponse(replay_story_stream(scenario_data, saved),
+                                     media_type="text/event-stream", headers=headers)
+        message = ("The AI is unavailable right now (API key failed or quota exhausted) and there is no "
+                   "saved story for this scenario yet. Please try again later.")
+        return StreamingResponse(error_stream(message), media_type="text/event-stream", headers=headers)
+
     try:
         scenario_data, seed_story, story_graph, initial_state = _build_graph_and_state(scenario, language=lang)
     except HTTPException:
@@ -309,9 +383,9 @@ async def api_run_stream(lang: str = "urdu", scenario: str = scn.DEFAULT_SCENARI
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     return StreamingResponse(
-        run_narrative_stream(scenario_data, seed_story, story_graph, initial_state),
+        run_narrative_stream(scenario_data, seed_story, story_graph, initial_state, lang),
         media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        headers=headers,
     )
 
 

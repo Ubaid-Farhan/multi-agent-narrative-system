@@ -96,6 +96,14 @@ npm run dev:frontend
 Everything is stored in `scenarios/<id>/scenario.json` (uploaded images in `scenarios/<id>/images/`). The next story run uses the saved changes; no restart needed.
 Note: on hosts with an ephemeral disk (e.g. Hugging Face Spaces), edits made through the panel are lost on restart. Commit `scenarios/` to keep them.
 
+### Saved Stories & Fallback (Neon Postgres)
+Set `DATABASE_URL` in `.env` (any Postgres; Neon recommended). The `stories` table is created automatically.
+
+- Every story that **completes** (has an ending and no failed `...` turns) is saved exactly as shown in the player.
+- Before starting a story, the API makes one tiny LLM call. If it fails (API key invalid, quota exhausted), a saved story for the same scenario is replayed as-is, turn by turn (`REPLAY_TURN_DELAY` seconds apart). Same language is preferred; the least-shown story is picked first.
+- `GET /api/run/stream?mode=auto|live|saved`: `auto` (default) = live, or replay if the LLM is down; `live` = always generate; `saved` = always replay.
+- Without `DATABASE_URL`, or if the database is unreachable, stories still run live; they just aren't saved.
+
 To run the CLI with another scenario: `uv run python src/main.py <scenario_id>`.
 
 The system will:

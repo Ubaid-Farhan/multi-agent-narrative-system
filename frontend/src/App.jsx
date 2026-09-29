@@ -170,6 +170,10 @@ export default function Home() {
           es.close();
           setCurrentTurn(-1);
           setIsLoading(false);
+        } else if (data.type === "error") {
+          es.close();
+          setIsLoading(false);
+          setRunError(data.message || "Story could not be started. Please try again.");
         }
       } catch (_) {}
     };
