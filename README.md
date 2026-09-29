@@ -133,7 +133,13 @@ uv run python src/main.py empty_buffet            # terminal only, another scena
 
 ## 4. The story player
 
-The start screen lets you pick a **scenario** (Kahani) and a **language** (Roman Urdu or English), then press **Start story**.
+The start screen is a menu with three choices:
+
+| Option | What happens |
+|---|---|
+| **Continue** | Shown when the selected scenario has an unfinished run (the AI stopped, the browser closed, the server restarted). The AI picks the **same run** back up from its last saved turn, with the same memories and world state, and the player jumps straight to that turn. |
+| **New story** | Pick a **scenario** (Kahani) and a **language** (Roman Urdu or English). The AI writes a brand-new story. |
+| **Purani stories** | Every saved run, newest first, for this scenario or all of them. Each shows **Poori** (complete) or **Adhoori** (unfinished), its turn count, language and date. **Play** watches it again; **Continue** is available on unfinished runs. |
 
 - **Live streaming:** turns appear as soon as the agents produce them (SSE).
 - **Scene view:** a full-screen background, the speaking character's image and name, and the Director's narration (expandable).
@@ -143,7 +149,7 @@ The start screen lets you pick a **scenario** (Kahani) and a **language** (Roman
 - **Navigation:** Prev / Next, a progress bar and turn dots, plus a replay button.
 - **Character cards:** the whole cast along the bottom, with the current speaker highlighted.
 - **No images yet?** Characters without an image show coloured initials, and scenarios without a background get a plain dark scene.
-- The last story is kept in memory, so a page refresh shows it again.
+- **Menu** (🏠 in the controls, or after the ending) goes back to the start menu at any time.
 
 ---
 
@@ -221,12 +227,14 @@ Set `DATABASE_URL` (any Postgres; Neon recommended). On startup the API brings t
 | `prompts` | The 9 prompt templates of each scenario |
 | `images` | Image files themselves (served at `/api/images/<id>`; identical files are stored once) |
 | `scenario_versions` | A full snapshot of the scenario at every save, with a note |
-| `story_runs` | One row per run (the **run number**): scenario + version, language, status, start/end time, turns, actions, twist turn, ending, models used, LLM call count, error, replay-pool flag, times replayed |
+| `story_runs` | One row per run (the **run number**): scenario + version, language, status, start/end time, turns, actions, twist turn, ending, models used, LLM call count, error, replay-pool flag, times replayed, and the **checkpoint** (full story state after the last turn) with how often the run was continued |
 | `story_events` | Every step of a run, in order: `director_narration`, `twist`, `rejected_dialogue`, `review`, `dialogue` (+ reasoning, decision), `action`, `world_state`, `conclusion_check`, `conclusion`, `error` |
 | `llm_calls` | Every prompt and response (story agents and the scenario generator): agent, model, latency, success/error. Kept for `LLM_LOG_RETENTION_DAYS` (default 30) |
 
 **How it behaves**
 - Events are written **as they happen** through a background queue, so recording never slows the story down. If a run stops halfway, what happened so far is kept, with status `failed` or `aborted`. Runs cut off by a server restart are marked `aborted` on the next start.
+- **Checkpoint after every turn:** the run's turns so far and its full story state (memories, world state, events) are saved after each turn. An unfinished run (`failed` / `aborted` / `incomplete` without an ending) can be **continued** from the player: the AI resumes the same run number from its last saved turn. When a story gets its ending the checkpoint is cleared, and the run can only be played again.
+- **Every run can be watched again** from the player's **Purani stories** list, complete or not.
 - A run is `completed` when it has an ending and no failed (`...`) turns. Only completed runs join the **replay pool**.
 - **When the LLM is down:** before a story starts, the API makes one tiny LLM call. If it fails (invalid key, exhausted quota, outage), a completed run of the same scenario is **replayed as-is**, turn by turn (`REPLAY_TURN_DELAY` seconds apart). Same language first, least-replayed first.
 - `GET /api/run/stream?mode=` `auto` (default: live, or replay if the LLM is down) · `live` (always generate) · `saved` (always replay).
@@ -397,6 +405,9 @@ Included scenarios: **The Rickshaw Accident** (default), **Khaali Degche Aur Hun
 | GET | `/api/scenarios/{id}/images/{file}` | Legacy image file from `scenarios/<id>/images/` |
 | GET | `/api/run/stream?scenario=&lang=urdu\|english&mode=auto\|live\|saved` | Run a story as SSE: `meta`, `turns`, `conclusion`, `done`, `error` |
 | POST | `/api/run?scenario=&lang=` | Run a full story and return it at once (also writes `story_output.json`, `prompts_log.json`) |
+| GET | `/api/run/stream?continue_run=<run id>` | Continue an unfinished run from its last saved turn (sends the saved turns first, then new ones) |
+| GET | `/api/runs?scenario=&continuable=true\|false&limit=&offset=` | Saved runs for the player (every run with at least one turn), newest first |
+| GET | `/api/runs/{id}` | One saved run: turns + ending, to play again |
 | GET | `/api/story` | Last story |
 | GET | `/api/tts?text=&speaker=&scenario=` | MP3 speech in the character's voice |
 
