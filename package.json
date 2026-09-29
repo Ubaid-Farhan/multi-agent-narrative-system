@@ -1,0 +1,12 @@
+{
+  "name": "ai-narrative-engine",
+  "private": true,
+  "scripts": {
+    "dev": "concurrently \"npm run dev:frontend\" \"npm run dev:api\"",
+    "dev:frontend": "cd frontend && npm run dev",
+    "dev:api": "uv run uvicorn src.api:app --reload --port 8080"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1"
+  }
+}

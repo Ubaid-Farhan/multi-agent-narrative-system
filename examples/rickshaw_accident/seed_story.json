@@ -1,0 +1,15 @@
+{
+    "title": "The Rickshaw Accident",
+    "description": "Late afternoon on Shahrah-e-Faisal near Karachi Airport. Rush hour traffic gridlock. 40°C heat, humid, dust everywhere. A green rickshaw driven by Saleem has collided with Ahmed Malik's white BMW — the BMW has a visible dent on the left rear door, the rickshaw's front bumper is bent. Both drivers are out of their vehicles shouting. Horns blaring from backed-up traffic. A crowd of 15-20 people has already gathered, some recording on phones, others shouting opinions. A chai dhaba is right on the corner. Traffic police (known for asking bribes) are approaching. Nobody can move their vehicle until this is resolved. The crowd is getting restless — they want the road cleared but they also want to see justice. In Karachi, the crowd decides more than the police.",
+    "setting": {
+        "location": "Shahrah-e-Faisal, near Karachi Airport, outside Uncle Jameel's shop",
+        "time": "Late afternoon, rush hour, around 5:30 PM",
+        "weather": "40°C, extremely humid, dusty",
+        "crowd": "15-20 people gathered, some recording on phones, mostly siding with the rickshaw driver",
+        "environment": "Non-stop honking from backed-up traffic, bus and truck drivers shouting, chai dhaba nearby, paan shop across the road",
+        "vehicles": {
+            "rickshaw": "Old green rickshaw, front bumper bent, blocking left lane",
+            "car": "White BMW, dent on left rear door, blocking right lane"
+        }
+    }
+}

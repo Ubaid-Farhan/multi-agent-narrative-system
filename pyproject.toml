@@ -1,0 +1,21 @@
+[project]
+name = "narrative-game-base"
+version = "0.1.0"
+description = "A multi-agent narrative game system using LangGraph"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "langgraph>=0.0.10",
+    "langchain-google-genai>=0.0.5",
+    "pydantic>=2.0.0",
+    "langchain-core",
+    "python-dotenv>=1.2.1",
+    "fastapi>=0.115.0",
+    "uvicorn>=0.32.0",
+    "langchain-groq>=1.1.2",
+    "langchain-openai>=1.2.1",
+    "edge-tts>=7.2.8",
+]
+
+[tool.uv]
+python-preference = "managed"
