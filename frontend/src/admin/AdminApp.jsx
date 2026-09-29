@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   BookOpen, Users, MessageSquareCode, SlidersHorizontal, Save, Plus, Trash2, LogOut,
-  Upload, Play, AlertTriangle, CheckCircle2, Loader2, X,
+  Upload, Play, AlertTriangle, CheckCircle2, Loader2, X, Sparkles,
 } from 'lucide-react';
 import { API_BASE, assetUrl, CHARACTER_COLORS } from '../lib/api';
 
@@ -182,6 +182,12 @@ function StoryTab({ data, update, imageProps, onJsonError }) {
   return (
     <div className="grid lg:grid-cols-2 gap-6">
       <div className="space-y-5">
+        <Field label="Status" help="Drafts are hidden from the player until published.">
+          <select className={`${inputCls} w-48`} value={data.status ?? 'published'} onChange={(e) => update((d) => ({ ...d, status: e.target.value }))}>
+            <option value="published">Published</option>
+            <option value="draft">Draft</option>
+          </select>
+        </Field>
         <Field label="Title"><input className={inputCls} value={data.title ?? ''} onChange={(e) => update((d) => ({ ...d, title: e.target.value }))} /></Field>
         <Field label="Subtitle" help="Shown under the title in the player, e.g. the location.">
           <input className={inputCls} value={data.subtitle ?? ''} onChange={(e) => update((d) => ({ ...d, subtitle: e.target.value }))} />
@@ -492,6 +498,121 @@ function Login({ onLogin }) {
   );
 }
 
+// ───────────────────────────── New with AI ─────────────────────────────
+
+const EXAMPLE_BRIEFS = [
+  'Lahore ki shaadi mein khana waqt se pehle khatam ho gaya — dulhe ka baap, caterer, dulhan ki phuppo aur photographer aamne saamne.',
+  'Karachi ke ek flat ki building mein lift phans gayi: landlord, ek naya kirayedar, chowkidar aur ek aunty jo sab jaanti hai.',
+  'Islamabad ke petrol pump pe line torne pe jhagra: ek fauji retired colonel, ek food-delivery rider, pump manager aur ek TikToker.',
+];
+
+function GenerateDialog({ token, onClose, onCreated }) {
+  const [brief, setBrief] = useState('');
+  const [count, setCount] = useState(4);
+  const [log, setLog] = useState([]);
+  const [running, setRunning] = useState(false);
+  const [error, setError] = useState('');
+  const abortRef = useRef(null);
+
+  useEffect(() => () => abortRef.current?.abort(), []);
+
+  const run = async () => {
+    setRunning(true);
+    setError('');
+    setLog([]);
+    const controller = new AbortController();
+    abortRef.current = controller;
+    try {
+      const res = await fetch(`${API_BASE}/api/admin/scenarios/generate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ brief, num_characters: count }),
+        signal: controller.signal,
+      });
+      if (!res.ok || !res.body) {
+        let detail = `Request failed (${res.status})`;
+        try { detail = (await res.json()).detail || detail; } catch (_) {}
+        throw new Error(detail);
+      }
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const parts = buffer.split('\n\n');
+        buffer = parts.pop();
+        for (const part of parts) {
+          if (!part.startsWith('data: ')) continue;
+          const event = JSON.parse(part.slice(6));
+          if (event.type === 'progress') setLog((l) => [...l, event.message]);
+          else if (event.type === 'error') throw new Error(event.message);
+          else if (event.type === 'done') { onCreated(event); return; }
+        }
+      }
+      throw new Error('The connection closed before the scenario was finished.');
+    } catch (e) {
+      if (e.name !== 'AbortError') setError(e.message);
+    } finally {
+      setRunning(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4" role="dialog" aria-modal="true" aria-labelledby="gen-title">
+      <div className="w-full max-w-2xl bg-gray-900 border border-white/10 rounded-2xl p-6 space-y-5 max-h-[90vh] overflow-y-auto">
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <h2 id="gen-title" className="text-xl font-bold text-amber-300 flex items-center gap-2"><Sparkles className="w-5 h-5" /> New scenario with AI</h2>
+            <p className="text-sm text-gray-400 mt-1">Describe the scene in a line or two. The AI writes the story seed, setting, characters with deep personas, and adapts every prompt. You add images afterwards.</p>
+          </div>
+          <button type="button" aria-label="Close" onClick={onClose} disabled={running} className="p-1 text-gray-400 hover:text-gray-200 disabled:opacity-30"><X className="w-5 h-5" /></button>
+        </div>
+
+        <Field label="Scene idea" help="Roman Urdu or English. Mention who is there and what just happened.">
+          <TextArea rows={4} value={brief} onChange={setBrief} disabled={running}
+            placeholder="e.g. Karachi ke ek flat ki building mein lift phans gayi…" />
+        </Field>
+        <div className="flex flex-wrap gap-2">
+          {EXAMPLE_BRIEFS.map((b) => (
+            <button key={b} type="button" disabled={running} onClick={() => setBrief(b)}
+              className="text-left text-xs px-3 py-1.5 rounded-lg bg-white/5 border border-white/10 text-gray-300 hover:bg-white/10 disabled:opacity-40">
+              {b.length > 70 ? `${b.slice(0, 70)}…` : b}
+            </button>
+          ))}
+        </div>
+        <Field label="Number of characters">
+          <select className={`${inputCls} w-32`} value={count} disabled={running} onChange={(e) => setCount(Number(e.target.value))}>
+            {[2, 3, 4, 5, 6].map((n) => <option key={n} value={n}>{n}</option>)}
+          </select>
+        </Field>
+
+        {(log.length > 0 || running) && (
+          <div className="rounded-xl bg-black/40 border border-white/10 p-3 space-y-1.5 text-sm" aria-live="polite">
+            {log.map((line, i) => (
+              <div key={i} className="flex items-start gap-2 text-gray-300">
+                <CheckCircle2 className="w-4 h-4 mt-0.5 text-emerald-400 shrink-0" /> {line}
+              </div>
+            ))}
+            {running && <div className="flex items-center gap-2 text-amber-300"><Loader2 className="w-4 h-4 animate-spin" /> Working… this usually takes 1–4 minutes.</div>}
+          </div>
+        )}
+        {error && <p className="text-sm text-red-400">{error}</p>}
+
+        <div className="flex justify-end gap-3">
+          <button type="button" onClick={() => (running ? abortRef.current?.abort() : onClose())}
+            className="px-4 py-2 rounded-lg text-sm text-gray-300 hover:bg-white/10">{running ? 'Stop' : 'Cancel'}</button>
+          <button type="button" onClick={run} disabled={running || brief.trim().length < 10}
+            className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg bg-linear-to-r from-amber-600 to-orange-600 text-white text-sm font-semibold disabled:opacity-40">
+            {running ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />} Generate
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ───────────────────────────── main ─────────────────────────────
 
 const TABS = [
@@ -512,6 +633,7 @@ export default function AdminApp() {
   const [status, setStatus] = useState(null); // {type: 'ok'|'error', text}
   const [saving, setSaving] = useState(false);
   const [jsonError, setJsonError] = useState(false);
+  const [showGenerate, setShowGenerate] = useState(false);
 
   const dirty = data !== null && JSON.stringify(data) !== savedJson;
 
@@ -522,7 +644,7 @@ export default function AdminApp() {
   };
 
   const loadList = async () => {
-    const res = await api('/api/scenarios');
+    const res = await api('/api/admin/scenarios', { token });
     setScenarios(res.scenarios ?? []);
     return res;
   };
@@ -599,6 +721,17 @@ export default function AdminApp() {
     } catch (e) { handleError(e); }
   };
 
+  const onGenerated = async (event) => {
+    setShowGenerate(false);
+    await loadList();
+    setData(null);
+    setScenarioId(event.id);
+    setTab('story');
+    const extra = event.warnings?.length ? ` Note: ${event.warnings.join(' ')}` : '';
+    setStatus({ type: event.warnings?.length ? 'error' : 'ok',
+      text: `Draft “${event.title}” created. Review it, add images, set Status to Published and Save.${extra}` });
+  };
+
   const deleteScenario = async () => {
     if (!window.confirm(`Delete "${data?.title}" permanently? Its images are deleted too. This cannot be undone.`)) return;
     try {
@@ -616,16 +749,21 @@ export default function AdminApp() {
 
   return (
     <div className="min-h-screen bg-gray-950 text-gray-100">
+      {showGenerate && <GenerateDialog token={token} onClose={() => setShowGenerate(false)} onCreated={onGenerated} />}
       <header className="sticky top-0 z-20 bg-gray-950/95 backdrop-blur border-b border-white/10">
         <div className="px-4 md:px-6 py-3 flex flex-wrap items-center gap-3">
           <span className="text-lg font-bold text-amber-300 mr-2">Narrative Admin</span>
           <label htmlFor="admin-scenario" className="sr-only">Scenario</label>
           <select id="admin-scenario" value={scenarioId ?? ''} onChange={(e) => switchScenario(e.target.value)}
             className="bg-gray-900 border border-white/15 rounded-lg px-3 py-1.5 text-sm min-w-48">
-            {scenarios.map((s) => <option key={s.id} value={s.id}>{s.title}</option>)}
+            {scenarios.map((s) => <option key={s.id} value={s.id}>{s.title}{s.status === 'draft' ? ' (draft)' : ''}</option>)}
           </select>
           <button type="button" onClick={createScenario} className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-white/10 hover:bg-white/15 text-sm">
             <Plus className="w-4 h-4" /> New
+          </button>
+          <button type="button" onClick={() => confirmDiscard() && setShowGenerate(true)}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 text-sm">
+            <Sparkles className="w-4 h-4" /> New with AI
           </button>
           <button type="button" onClick={deleteScenario} disabled={isDefault || !data} title={isDefault ? 'The default scenario cannot be deleted' : 'Delete scenario'}
             className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm text-red-300 hover:bg-red-500/10 disabled:opacity-30 disabled:cursor-not-allowed">

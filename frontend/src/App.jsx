@@ -5,6 +5,18 @@ import { Button } from './components/button';
 import { API_BASE, assetUrl, colorsFor } from './lib/api';
 import './App.css';
 
+// Character picture, or a coloured initial when no image has been added yet (e.g. AI-generated scenarios).
+function CharacterPicture({ image, name, color, className, large = false }) {
+  if (image) return <img src={assetUrl(image)} alt={name} className={className} />;
+  const initials = (name || '?').split(/\s+/).filter(Boolean).slice(0, 2).map((w) => w[0]).join('').toUpperCase();
+  return (
+    <div role="img" aria-label={name}
+      className={`${large ? 'w-32 h-32 md:w-44 md:h-44 text-4xl md:text-5xl' : 'w-full h-full text-lg'} rounded-full bg-linear-to-br ${colorsFor(color).bg} text-white font-bold flex items-center justify-center shadow-2xl`}>
+      {initials}
+    </div>
+  );
+}
+
 function WaveformIcon() {
   const bar = (delay) => (
     <span
@@ -276,11 +288,15 @@ export default function Home() {
 
       {/* ── Full-bleed scene ── */}
       <div className="relative overflow-hidden flex-1" style={{ minHeight: 'calc(100vh - 260px)' }}>
-        <img
-          src={assetUrl(scenarioInfo?.background_image) || "/img12.png"}
-          alt="Scene"
-          className="absolute inset-0 w-full h-full object-cover"
-        />
+        {scenarioInfo && !scenarioInfo.background_image ? (
+          <div className="absolute inset-0 bg-linear-to-br from-gray-900 via-slate-900 to-black" />
+        ) : (
+          <img
+            src={assetUrl(scenarioInfo?.background_image) || "/img12.png"}
+            alt="Scene"
+            className="absolute inset-0 w-full h-full object-cover"
+          />
+        )}
         <div className="absolute inset-0 bg-linear-to-t from-black/80 via-black/10 to-black/50" />
 
         {/* Title overlay */}
@@ -425,9 +441,11 @@ export default function Home() {
                 transition={{ delay: 0.2, duration: 0.5 }}
                 className="flex flex-col items-center"
               >
-                <img
-                  src={assetUrl(charByKey[currentData.character]?.image)}
-                  alt={currentData.speaker}
+                <CharacterPicture
+                  large
+                  image={charByKey[currentData.character]?.image}
+                  name={currentData.speaker}
+                  color={charByKey[currentData.character]?.color}
                   className="h-48 md:h-72 object-contain drop-shadow-2xl"
                 />
                 <div className={`mt-1 px-3 py-0.5 rounded-full bg-linear-to-r ${colorsOf(currentData.character).bg} text-white text-xs font-semibold shadow-lg whitespace-nowrap`}>
@@ -665,9 +683,10 @@ export default function Home() {
               }`}
             >
               <div className="w-14 h-14 shrink-0 rounded-lg overflow-hidden bg-gray-800 flex items-center justify-center">
-                <img
-                  src={assetUrl(image)}
-                  alt={name}
+                <CharacterPicture
+                  image={image}
+                  name={name}
+                  color={charByKey[key]?.color}
                   className="w-full h-full object-contain object-center"
                 />
               </div>

@@ -36,6 +36,7 @@ from src.graph.narrative_graph import NarrativeGraph
 from src.story_state import StoryStateManager
 from src import scenarios as scn
 from src import db
+from src import scenario_generator
 from src.agents.base_agent import BaseAgent
 from contextlib import asynccontextmanager
 
@@ -421,12 +422,6 @@ def api_scenario_image(scenario_id: str, filename: str):
 ADMIN_TOKEN_TTL = 12 * 60 * 60  # seconds
 ALLOWED_IMAGE_TYPES = {".png": "png", ".jpg": "jpeg", ".jpeg": "jpeg", ".webp": "webp"}
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
-TTS_VOICES = [
-    "hi-IN-MadhurNeural", "hi-IN-SwaraNeural", "ur-PK-AsadNeural", "ur-PK-UzmaNeural",
-    "ur-IN-SalmanNeural", "ur-IN-GulNeural", "en-IN-PrabhatNeural", "en-IN-NeerjaNeural",
-    "en-US-GuyNeural", "en-US-JennyNeural",
-]
-CHARACTER_COLORS = ["amber", "blue", "slate", "emerald", "rose", "violet", "cyan", "orange"]
 
 
 def _admin_key() -> bytes:
@@ -465,10 +460,47 @@ def api_admin_meta():
     """Editor helpers: placeholders per prompt, TTS voices, colors, default settings."""
     return {
         "prompts": scn.PROMPT_PLACEHOLDERS,
-        "voices": TTS_VOICES,
-        "colors": CHARACTER_COLORS,
+        "voices": scn.TTS_VOICES,
+        "colors": scn.CHARACTER_COLORS,
         "default_settings": scn.DEFAULT_SETTINGS,
     }
+
+
+@app.get("/api/admin/scenarios", dependencies=[Depends(require_admin)])
+def api_admin_list_scenarios():
+    """All scenarios including drafts (the public list hides drafts)."""
+    return {"scenarios": scn.list_scenarios(include_drafts=True), "default": scn.DEFAULT_SCENARIO_ID}
+
+
+@app.post("/api/admin/scenarios/generate", dependencies=[Depends(require_admin)])
+async def api_admin_generate_scenario(payload: dict = Body(...)):
+    """
+    "New with AI": stream progress while the model writes a full scenario from a short idea.
+    Events: progress {message}, done {id, title, warnings}, error {message}. Saved as a draft.
+    """
+    brief = str(payload.get("brief", ""))
+    try:
+        num_characters = int(payload.get("num_characters", 4))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=422, detail="num_characters must be a number")
+
+    async def stream():
+        try:
+            async for event in scenario_generator.generate_scenario(brief, num_characters):
+                if event["type"] == "done":
+                    scenario = event["scenario"]
+                    new_id = scn.unique_id(scenario["title"])
+                    scn.save_scenario(new_id, scenario)
+                    print(f"[Generator] Saved draft scenario '{new_id}'")
+                    yield f"data: {json.dumps({'type': 'done', 'id': new_id, 'title': scenario['title'], 'warnings': event['warnings']})}\n\n"
+                else:
+                    yield f"data: {json.dumps(event)}\n\n"
+        except Exception as e:
+            print(f"[Generator] Failed: {e!r}")
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e) or e.__class__.__name__})}\n\n"
+
+    return StreamingResponse(stream(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 @app.get("/api/admin/scenarios/{scenario_id}", dependencies=[Depends(require_admin)])

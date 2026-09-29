@@ -25,6 +25,14 @@ DEFAULT_SETTINGS = {
     "post_twist_turns": 5,
 }
 
+TTS_VOICES = [
+    "hi-IN-MadhurNeural", "hi-IN-SwaraNeural", "ur-PK-AsadNeural", "ur-PK-UzmaNeural",
+    "ur-IN-SalmanNeural", "ur-IN-GulNeural", "en-IN-PrabhatNeural", "en-IN-NeerjaNeural",
+    "en-US-GuyNeural", "en-US-JennyNeural",
+]
+CHARACTER_COLORS = ["amber", "blue", "slate", "emerald", "rose", "violet", "cyan", "orange"]
+SCENARIO_STATUSES = ("published", "draft")
+
 # Placeholders each prompt may use ("allowed"), and the ones it cannot work without ("required").
 PROMPT_PLACEHOLDERS = {
     "character": {
@@ -76,16 +84,30 @@ def scenario_dir(scenario_id: str) -> Path:
     return SCENARIOS_DIR / _check_id(scenario_id)
 
 
-def list_scenarios() -> List[Dict]:
+def list_scenarios(include_drafts: bool = False) -> List[Dict]:
     items = []
     if SCENARIOS_DIR.exists():
         for path in sorted(SCENARIOS_DIR.glob("*/scenario.json")):
             try:
                 data = json.loads(path.read_text())
-                items.append({"id": path.parent.name, "title": data.get("title", path.parent.name)})
             except (OSError, json.JSONDecodeError):
                 continue
+            status = data.get("status") or "published"
+            if status == "draft" and not include_drafts:
+                continue
+            items.append({"id": path.parent.name, "title": data.get("title", path.parent.name), "status": status})
     return items
+
+
+def unique_id(base: str) -> str:
+    """Slug from a title that doesn't collide with an existing scenario folder."""
+    slug = re.sub(r"[^a-z0-9]+", "_", base.lower()).strip("_")[:56] or "scenario"
+    if not slug[0].isalnum():
+        slug = "s" + slug
+    candidate, n = slug, 2
+    while (SCENARIOS_DIR / candidate).exists():
+        candidate, n = f"{slug}_{n}", n + 1
+    return candidate
 
 
 def load_scenario(scenario_id: str = DEFAULT_SCENARIO_ID) -> Dict:
@@ -111,6 +133,9 @@ def validate_scenario(data: Dict) -> Dict:
 
     if not str(data.get("title", "")).strip():
         raise ScenarioError("Title is required.")
+    data["status"] = data.get("status") or "published"
+    if data["status"] not in SCENARIO_STATUSES:
+        raise ScenarioError("Status must be 'published' or 'draft'.")
     if not str(data.get("description", "")).strip():
         raise ScenarioError("Story description is required.")
 
