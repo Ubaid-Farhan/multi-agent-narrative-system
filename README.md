@@ -96,6 +96,19 @@ npm run dev:frontend
 Everything is stored in `scenarios/<id>/scenario.json` (uploaded images in `scenarios/<id>/images/`). The next story run uses the saved changes; no restart needed.
 Note: on hosts with an ephemeral disk (e.g. Hugging Face Spaces), edits made through the panel are lost on restart. Commit `scenarios/` to keep them.
 
+### New Scenario with AI
+In the admin panel, **✨ New with AI** turns a one- or two-line idea (Roman Urdu or English) into a complete scenario:
+story seed, setting, characters (description, goals, inventory, deep persona, English style, appeal keywords,
+reviewer notes, voice, colour) and every Director / Reviewer / character prompt adapted to the new scene.
+
+- Model: self-hosted **gpt-oss** (`GPT_OSS_BASE_URL`, OpenAI-compatible). If that server is down, **Gemini** is used
+  with its own models (`SCENARIO_GEMINI_MODEL`) so the story models' daily quota is untouched. Paid OpenAI is never used here.
+- The Rickshaw scenario is the quality reference: the model is shown it and must match its depth.
+  Work is split into a blueprint, one call per character and one per prompt; every prompt is checked
+  (placeholders, JSON braces) and sent back for fixing if broken.
+- The result is saved as a **Draft** (hidden from the player). Add images, review, set Status to **Published**, Save.
+- Takes ~1–7 minutes depending on the model.
+
 ### Saved Stories & Fallback (Neon Postgres)
 Set `DATABASE_URL` in `.env` (any Postgres; Neon recommended). The `stories` table is created automatically.
 

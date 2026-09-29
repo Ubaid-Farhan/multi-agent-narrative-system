@@ -8,7 +8,7 @@ Quality comes from three things:
      instead of one giant response.
   3. Every rewritten prompt is checked (placeholders, JSON braces) and sent back for fixing if broken.
 
-Model: the self-hosted gpt-oss server when GPT_OSS_BASE_URL is set, with Gemini as fallback.
+Model: the self-hosted gpt-oss server (GPT_OSS_BASE_URL); Gemini only if that server is down. Never paid OpenAI.
 Images are not generated — they are added from the admin panel.
 """
 import asyncio
@@ -39,7 +39,8 @@ ADAPTED_PROMPTS = [
 
 VOICE_GUIDE = """TTS voices (dialogue is Roman Urdu, which the hi-IN voices read best):
 - hi-IN-MadhurNeural = male, hi-IN-SwaraNeural = female  ← use these for almost every character
-- en-IN-PrabhatNeural = male, en-IN-NeerjaNeural = female ← only for a character who speaks mostly English
+- en-IN-PrabhatNeural = male, en-IN-NeerjaNeural = female ← only if a character speaks almost ONLY English
+  (code-switching elites still use hi-IN; the dialogue is Roman Urdu)
 Make characters sound distinct with rate (-25%..+30%) and pitch (-12Hz..+12Hz):
 older/heavier/commanding → slower and lower; young/anxious/theatrical → faster and higher."""
 
@@ -116,7 +117,10 @@ def _blueprint_example(gold: Dict) -> Dict:
 # ─────────────────────────────── LLM plumbing ───────────────────────────────
 
 def _build_llm():
-    """gpt-oss (if GPT_OSS_BASE_URL is set) → Gemini models → OpenAI (if OPENAI_API_KEY is set)."""
+    """
+    gpt-oss (GPT_OSS_BASE_URL) first; Gemini only if that server is down. No paid OpenAI here.
+    Gemini uses its own models (SCENARIO_GEMINI_MODEL...) so it doesn't eat the story models' daily quota.
+    """
     chain, labels = [], []
 
     base_url = os.getenv("GPT_OSS_BASE_URL", "").strip()
@@ -134,19 +138,15 @@ def _build_llm():
         labels.append("gpt-oss")
 
     if os.getenv("GOOGLE_API_KEY"):
-        primary = os.getenv("SCENARIO_GEMINI_MODEL") or os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-        backups = [m.strip() for m in os.getenv("GEMINI_FALLBACK_MODELS", "gemini-2.5-flash-lite,gemini-flash-latest").split(",")]
-        for model in dict.fromkeys([primary, *backups]):
-            if model:
-                chain.append(ChatGoogleGenerativeAI(model=model, temperature=0.8, max_output_tokens=16384, max_retries=1))
+        models = [os.getenv("SCENARIO_GEMINI_MODEL", "gemini-flash-latest"),
+                  *os.getenv("SCENARIO_GEMINI_FALLBACK_MODELS", "gemini-2.5-flash-lite").split(",")]
+        for model in dict.fromkeys(m.strip() for m in models if m.strip()):
+            chain.append(ChatGoogleGenerativeAI(model=model, temperature=0.8, max_output_tokens=16384, max_retries=1))
         labels.append("Gemini")
 
-    if os.getenv("OPENAI_API_KEY"):
-        chain.append(ChatOpenAI(model=os.getenv("OPENAI_MODEL", "gpt-5"), max_tokens=16000, timeout=600, max_retries=1))
-        labels.append("OpenAI")
-
     if not chain:
-        raise RuntimeError("No model configured: set GPT_OSS_BASE_URL (gpt-oss), GOOGLE_API_KEY or OPENAI_API_KEY.")
+        raise RuntimeError("No model configured for 'New with AI': set GPT_OSS_BASE_URL (gpt-oss server) "
+                           "or GOOGLE_API_KEY (Gemini fallback).")
     llm = chain[0].with_fallbacks(chain[1:]) if len(chain) > 1 else chain[0]
     return llm, " → ".join(labels)
 
@@ -311,7 +311,8 @@ persona — 350-550 words, second person, with these sections in this order (sam
     they genuinely know, stated explicitly).
   WHAT YOU WOULD NEVER DO: 4 bullets.
 english_style — 3 lines like the examples: style description + 2 example lines in English.
-appeals — 2-4 recurring emotional/tactical appeals this character is likely to overuse, each mapped to
+appeals — 2-4 recurring emotional/tactical appeals this character is likely to overuse. Name each one in
+  plain words like the examples ("Bachche/children appeal", "Flight urgency"), each mapped to
   6-12 short lowercase keywords (Roman Urdu spellings AND English) that detect it in dialogue.
 review_notes_urdu — 1-2 sentences: what the Reviewer must check about this character's language and
   behaviour in Roman Urdu mode (register, English level, politeness, physicality).
