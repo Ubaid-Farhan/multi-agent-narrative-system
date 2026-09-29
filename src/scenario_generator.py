@@ -138,8 +138,9 @@ def _build_llm():
         labels.append("gpt-oss")
 
     if os.getenv("GOOGLE_API_KEY"):
-        models = [os.getenv("SCENARIO_GEMINI_MODEL", "gemini-flash-latest"),
-                  *os.getenv("SCENARIO_GEMINI_FALLBACK_MODELS", "gemini-2.5-flash-lite").split(",")]
+        # Different models from the story chain (GEMINI_MODEL / GEMINI_FALLBACK_MODELS): Gemini quotas are per model.
+        models = [os.getenv("SCENARIO_GEMINI_MODEL", "gemini-3.5-flash"),
+                  *os.getenv("SCENARIO_GEMINI_FALLBACK_MODELS", "gemini-3.5-flash-lite,gemini-3.1-flash-lite").split(",")]
         for model in dict.fromkeys(m.strip() for m in models if m.strip()):
             chain.append(ChatGoogleGenerativeAI(model=model, temperature=0.8, max_output_tokens=16384, max_retries=1))
         labels.append("Gemini")
@@ -159,18 +160,34 @@ def _text(response) -> str:
 
 
 async def _call(llm, sem: asyncio.Semaphore, user: str) -> str:
-    transient = ("429", "503", "UNAVAILABLE", "RESOURCE_EXHAUSTED", "timed out", "Timeout", "Cannot connect",
-                 "Connection", "name resolution")
-    for attempt in range(3):
+    """One model call (the fallback chain is tried inside); waits and retries on overload / rate limits."""
+    transient = ("429", "503", "UNAVAILABLE", "RESOURCE_EXHAUSTED", "overloaded", "high demand", "timed out",
+                 "Timeout", "Cannot connect", "Connection", "name resolution")
+    attempts = 4
+    for attempt in range(attempts):
         try:
             async with sem:
                 return _text(await llm.ainvoke([("system", DESIGNER_SYSTEM), ("human", user)]))
         except Exception as e:
-            if attempt < 2 and any(t in str(e) for t in transient):
-                await asyncio.sleep(10 * (attempt + 1))
+            if attempt < attempts - 1 and any(t in str(e) for t in transient):
+                await asyncio.sleep(15 * (attempt + 1))
                 continue
             raise
     return ""
+
+
+def friendly_error(e: Exception) -> str:
+    """Readable message for the admin panel instead of a raw provider error."""
+    text = str(e)
+    if any(t in text for t in ("503", "UNAVAILABLE", "high demand", "overloaded")):
+        return ("The AI models are overloaded right now (503). Please try again in a few minutes — "
+                "or set GPT_OSS_BASE_URL in .env to use your own gpt-oss server.")
+    if any(t in text for t in ("429", "RESOURCE_EXHAUSTED", "quota")):
+        return ("The Gemini daily free quota is used up (429). Try again later, or set GPT_OSS_BASE_URL "
+                "in .env to use your own gpt-oss server.")
+    if any(t in text for t in ("API_KEY_INVALID", "API key not valid", "401", "PERMISSION_DENIED")):
+        return "The API key was rejected. Check GOOGLE_API_KEY / GPT_OSS_API_KEY in .env and restart the API."
+    return text or e.__class__.__name__
 
 
 def _parse_json(text: str) -> Dict:

@@ -102,7 +102,7 @@ story seed, setting, characters (description, goals, inventory, deep persona, En
 reviewer notes, voice, colour) and every Director / Reviewer / character prompt adapted to the new scene.
 
 - Model: self-hosted **gpt-oss** (`GPT_OSS_BASE_URL`, OpenAI-compatible). If that server is down, **Gemini** is used
-  with its own models (`SCENARIO_GEMINI_MODEL`) so the story models' daily quota is untouched. Paid OpenAI is never used here.
+  with its own models (`SCENARIO_GEMINI_MODEL`, default `gemini-3.5-flash`) so the story models' daily quota is untouched. Paid OpenAI is never used here.
 - The Rickshaw scenario is the quality reference: the model is shown it and must match its depth.
   Work is split into a blueprint, one call per character and one per prompt; every prompt is checked
   (placeholders, JSON braces) and sent back for fixing if broken.

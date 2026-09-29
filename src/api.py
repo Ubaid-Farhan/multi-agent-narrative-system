@@ -497,7 +497,7 @@ async def api_admin_generate_scenario(payload: dict = Body(...)):
                     yield f"data: {json.dumps(event)}\n\n"
         except Exception as e:
             print(f"[Generator] Failed: {e!r}")
-            yield f"data: {json.dumps({'type': 'error', 'message': str(e) or e.__class__.__name__})}\n\n"
+            yield f"data: {json.dumps({'type': 'error', 'message': scenario_generator.friendly_error(e)})}\n\n"
 
     return StreamingResponse(stream(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
