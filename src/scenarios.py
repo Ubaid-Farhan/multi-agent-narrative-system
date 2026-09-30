@@ -89,7 +89,7 @@ def list_scenarios(include_drafts: bool = False) -> List[Dict]:
     if SCENARIOS_DIR.exists():
         for path in sorted(SCENARIOS_DIR.glob("*/scenario.json")):
             try:
-                data = json.loads(path.read_text())
+                data = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 continue
             status = data.get("status") or "published"
@@ -114,7 +114,7 @@ def load_scenario(scenario_id: str = DEFAULT_SCENARIO_ID) -> Dict:
     path = scenario_dir(scenario_id) / "scenario.json"
     if not path.exists():
         raise FileNotFoundError(f"Scenario '{scenario_id}' not found")
-    data = json.loads(path.read_text())
+    data = json.loads(path.read_text(encoding="utf-8"))
     data["id"] = scenario_id
     data["settings"] = {**DEFAULT_SETTINGS, **data.get("settings", {})}
     return data
@@ -221,7 +221,7 @@ def save_scenario(scenario_id: str, data: Dict) -> Dict:
     folder = scenario_dir(scenario_id)
     folder.mkdir(parents=True, exist_ok=True)
     tmp = folder / "scenario.json.tmp"
-    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     tmp.replace(folder / "scenario.json")
     return data
 

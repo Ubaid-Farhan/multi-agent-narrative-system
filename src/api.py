@@ -422,7 +422,7 @@ async def api_run(lang: str = "urdu", scenario: str = scn.DEFAULT_SCENARIO_ID):
             "conclusion_reason": conclusion_reason,
         },
     }
-    output_path.write_text(json.dumps(output_data, indent=2, default=str))
+    output_path.write_text(json.dumps(output_data, indent=2, default=str), encoding="utf-8")
 
     all_logs = []
     for log in director.logs:
@@ -437,7 +437,7 @@ async def api_run(lang: str = "urdu", scenario: str = scn.DEFAULT_SCENARIO_ID):
             all_logs.append(log)
     all_logs.sort(key=lambda x: x["timestamp"])
     prompts_path = project_root / "prompts_log.json"
-    prompts_path.write_text(json.dumps(all_logs, indent=2, default=str))
+    prompts_path.write_text(json.dumps(all_logs, indent=2, default=str), encoding="utf-8")
 
     return payload
 

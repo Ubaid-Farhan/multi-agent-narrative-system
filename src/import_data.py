@@ -56,7 +56,7 @@ async def import_scenarios() -> list:
         if scenario_id in in_db:
             continue
         try:
-            data = json.loads(path.read_text())
+            data = json.loads(path.read_text(encoding="utf-8"))
             data["background_image"] = await _store_image(data.get("background_image") or "", scenario_id, cache)
             for char in data.get("characters", []):
                 char["image"] = await _store_image(char.get("image") or "", scenario_id, cache)
