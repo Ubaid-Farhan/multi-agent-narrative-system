@@ -38,6 +38,7 @@ from src.story_state import StoryStateManager
 from src import scenarios as scn
 from src import db
 from src import scenario_generator
+from src import image_generator
 from src import scenario_store as store
 from src import run_recorder
 from src.run_recorder import RunRecorder
@@ -617,6 +618,7 @@ async def api_admin_meta():
         "default_settings": scn.DEFAULT_SETTINGS,
         "database": await db.ensure(),
         "llm_log": {"enabled": run_recorder.LLM_LOG_ENABLED, "retention_days": run_recorder.LLM_LOG_RETENTION_DAYS},
+        "image_generation": image_generator.info(),
     }
 
 
@@ -636,6 +638,7 @@ async def api_admin_generate_scenario(payload: dict = Body(...)):
     if not await db.ensure():
         raise _http_error(store.ReadOnlyError())
     brief = str(payload.get("brief", ""))
+    with_images = bool(payload.get("images", True)) and image_generator.enabled()
     try:
         num_characters = int(payload.get("num_characters", 4))
     except (TypeError, ValueError):
@@ -647,9 +650,13 @@ async def api_admin_generate_scenario(payload: dict = Body(...)):
                 if event["type"] == "done":
                     scenario = event["scenario"]
                     new_id = await store.unique_id(scenario["title"])
+                    warnings = list(event["warnings"])
+                    if with_images:
+                        async for update in _generate_images_stream(new_id, scenario, warnings):
+                            yield update
                     await store.save_scenario(new_id, scenario, note="Generated with AI", create=True)
                     print(f"[Generator] Saved draft scenario '{new_id}'")
-                    yield f"data: {json.dumps({'type': 'done', 'id': new_id, 'title': scenario['title'], 'warnings': event['warnings']})}\n\n"
+                    yield f"data: {json.dumps({'type': 'done', 'id': new_id, 'title': scenario['title'], 'warnings': warnings})}\n\n"
                 else:
                     yield f"data: {json.dumps(event)}\n\n"
         except Exception as e:
@@ -759,6 +766,55 @@ async def api_admin_upload_image(scenario_id: str, payload: dict = Body(...)):
         return {"url": await store.save_image(scenario_id, filename, raw)}
     except Exception as e:
         raise _http_error(e)
+
+
+# ─────────────────────────────── Admin: AI images ───────────────────────────────
+
+async def _generate_images_stream(scenario_id: str, scenario: dict, warnings: list):
+    """Draw the background and every character of a new scenario, yielding progress as SSE lines."""
+    queue: asyncio.Queue = asyncio.Queue()
+
+    async def progress(message: str):
+        await queue.put(message)
+
+    async def save(filename: str, raw: bytes) -> str:
+        return await store.save_image(scenario_id, filename, raw)
+
+    def sse(message: str) -> str:
+        return f"data: {json.dumps({'type': 'progress', 'step': 'images', 'message': message})}\n\n"
+
+    count = 1 + len(scenario.get("characters", []))
+    yield sse(f"Drawing {count} images ({image_generator.MODEL.rsplit('/', 1)[-1]})…")
+    task = asyncio.create_task(image_generator.generate_scenario_images(scenario, save, progress))
+    while not (task.done() and queue.empty()):
+        try:
+            yield sse(await asyncio.wait_for(queue.get(), timeout=1))
+        except asyncio.TimeoutError:
+            pass
+    warnings.extend(task.result())
+
+
+@app.post("/api/admin/images/prompt", dependencies=[Depends(require_admin)])
+async def api_admin_image_prompt(payload: dict = Body(...)):
+    """Suggested prompt for a background ({target: 'background', scenario}) or a character (+ character)."""
+    scenario = payload.get("scenario") or {}
+    if payload.get("target") == "character":
+        return {"prompt": image_generator.character_prompt(scenario, payload.get("character") or {})}
+    return {"prompt": image_generator.background_prompt(scenario)}
+
+
+@app.post("/api/admin/scenarios/{scenario_id}/images/generate", dependencies=[Depends(require_admin)])
+async def api_admin_generate_image(scenario_id: str, payload: dict = Body(...)):
+    """Generate an image from {prompt, target} and store it. Returns its URL; the scenario itself is not changed."""
+    await _load_scenario_or_404(scenario_id)
+    if not await db.ensure():
+        raise _http_error(store.ReadOnlyError())
+    try:
+        raw = await image_generator.generate(str(payload.get("prompt", "")))
+    except image_generator.ImageGenerationError as e:
+        raise HTTPException(status_code=502 if image_generator.enabled() else 503, detail=str(e))
+    kind = "character" if payload.get("target") == "character" else "background"
+    return {"url": await store.save_image(scenario_id, f"ai-{kind}.jpg", raw)}
 
 
 # ─────────────────────────────── Admin: story runs ───────────────────────────────

@@ -65,14 +65,63 @@ export function Badge({ tone = 'gray', title, children }) {
   );
 }
 
-export function Spinner({ label }) {
+// ───────────── loading skeletons (grey blocks shaped like the content that is coming) ─────────────
+
+export function Skeleton({ className = '' }) {
+  return <div className={`animate-pulse rounded-lg bg-slate-200/70 ${className}`} />;
+}
+
+// A form card: title, subtitle and a few label + input rows.
+export function SkeletonCard({ fields = 3, tall = false, className = '' }) {
   return (
-    <div className="flex items-center gap-3 text-sm text-slate-500 py-10 justify-center">
-      <span className="h-5 w-5 animate-spin rounded-full border-b-2 border-amber-700" />
-      {label}
+    <div className={`bg-white rounded-2xl border border-gray-100 shadow-sm ${className}`} aria-hidden="true">
+      <div className="px-6 pt-5 pb-4 border-b border-gray-100 space-y-2">
+        <Skeleton className="h-4 w-32" />
+        <Skeleton className="h-3 w-56" />
+      </div>
+      <div className="p-6 space-y-5">
+        {Array.from({ length: fields }, (_, i) => (
+          <div key={i} className="space-y-2">
+            <Skeleton className="h-3 w-20" />
+            <Skeleton className={tall && i === fields - 1 ? 'h-40 w-full' : 'h-11 w-full'} />
+          </div>
+        ))}
+      </div>
     </div>
   );
 }
+
+// Table rows inside an existing card.
+export function SkeletonRows({ rows = 6, cols = 5 }) {
+  return (
+    <div className="divide-y divide-gray-100" aria-hidden="true">
+      <div className="bg-gray-50 px-5 py-4 flex gap-6">
+        {Array.from({ length: cols }, (_, i) => <Skeleton key={i} className="h-3 flex-1 max-w-24" />)}
+      </div>
+      {Array.from({ length: rows }, (_, r) => (
+        <div key={r} className="px-5 py-4 flex items-center gap-6">
+          {Array.from({ length: cols }, (_, c) => (
+            <Skeleton key={c} className={`h-4 flex-1 ${c === 0 ? 'max-w-12' : c === 1 ? 'max-w-56' : 'max-w-24'}`} />
+          ))}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// Page header: title, badge, subtitle and action buttons.
+export function SkeletonHeader({ actions = 2 }) {
+  return (
+    <div className="flex flex-wrap items-start justify-between gap-4" aria-hidden="true">
+      <div className="space-y-2.5">
+        <div className="flex items-center gap-2.5"><Skeleton className="h-7 w-64" /><Skeleton className="h-5 w-20 rounded-full" /></div>
+        <Skeleton className="h-4 w-80" />
+      </div>
+      <div className="flex gap-2">{Array.from({ length: actions }, (_, i) => <Skeleton key={i} className={`h-10 ${i === 0 ? 'w-32' : 'w-10'}`} />)}</div>
+    </div>
+  );
+}
+
 
 export function Notice({ tone, children, onDismiss }) {
   const styles = {
@@ -153,6 +202,3 @@ export function MoreMenu({ items, label = 'More actions' }) {
   );
 }
 
-export function initials(name) {
-  return (name || '?').split(/\s+/).filter(Boolean).slice(0, 2).map((w) => w[0].toUpperCase()).join('');
-}

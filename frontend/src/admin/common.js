@@ -60,3 +60,7 @@ export function timeAgo(iso) {
 export function formatDate(iso) {
   return iso ? new Date(iso).toLocaleString() : '—';
 }
+
+export function initials(name) {
+  return (name || '?').split(/\s+/).filter(Boolean).slice(0, 2).map((w) => w[0].toUpperCase()).join('');
+}

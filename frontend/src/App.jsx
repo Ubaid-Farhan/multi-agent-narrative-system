@@ -562,9 +562,6 @@ export default function Home() {
                     <History className="w-5 h-5 mr-2" /> Purani stories
                   </Button>
                 </div>
-                <a href="/admin" className="mt-6 flex items-center justify-center gap-1.5 text-xs text-gray-400! hover:text-amber-300!">
-                  <Settings className="w-3.5 h-3.5" /> Admin panel
-                </a>
               </div>
             </motion.div>
           )}
