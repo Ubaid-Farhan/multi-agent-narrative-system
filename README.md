@@ -250,7 +250,7 @@ Set `DATABASE_URL` (any Postgres; Neon recommended). On startup the API brings t
 
 | Task | Model chain |
 |---|---|
-| **Running a story** (Director, characters, Reviewer) | `GEMINI_MODEL` (default `gemini-2.5-flash`) → `GEMINI_FALLBACK_MODELS` (`gemini-2.5-flash-lite`, `gemini-flash-latest`) → OpenAI `OPENAI_MODEL` *(only if `OPENAI_API_KEY` is set)* |
+| **Running a story** (Director, characters, Reviewer) | `GEMINI_MODEL` (default `gemini-3.7-flash`) → `GEMINI_FALLBACK_MODELS` (`gemini-3.5-flash`, `gemini-flash-latest`, `gemini-3.5-flash-lite`) → OpenAI `OPENAI_MODEL` *(only if `OPENAI_API_KEY` is set)* |
 | **New with AI** | gpt-oss (`GPT_OSS_BASE_URL`) → `SCENARIO_GEMINI_MODEL` (`gemini-3.5-flash`) → `SCENARIO_GEMINI_FALLBACK_MODELS`. **Never OpenAI** |
 
 - **Retries:** rate limits (429), overload (503), network / DNS errors and empty responses are retried with increasing waits before moving on.
@@ -322,8 +322,8 @@ All settings live in `.env` (copy from `.env.example`). Restart the API after ch
 | Variable | Default | Purpose |
 |---|---|---|
 | `GOOGLE_API_KEY` | — | Gemini key (stories, and generator fallback) |
-| `GEMINI_MODEL` | `gemini-2.5-flash` | Main story model |
-| `GEMINI_FALLBACK_MODELS` | `gemini-2.5-flash-lite,gemini-flash-latest` | Backup story models |
+| `GEMINI_MODEL` | `gemini-3.7-flash` | Main story model |
+| `GEMINI_FALLBACK_MODELS` | `gemini-3.5-flash,gemini-flash-latest,gemini-3.5-flash-lite` | Backup story models |
 | `OPENAI_API_KEY` | *(empty)* | Optional paid last-resort for stories |
 | `OPENAI_MODEL` | `gpt-5` | OpenAI model |
 | `ADMIN_PASSWORD` | *(empty = admin disabled)* | Admin panel password |

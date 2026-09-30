@@ -8,11 +8,11 @@ load_dotenv()
 class StoryConfig:
     """Configuration for the story simulation."""
     # Primary LLM: Gemini. Fallback: OpenAI (used only if OPENAI_API_KEY is set).
-    model_name: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    model_name: str = os.getenv("GEMINI_MODEL", "gemini-3.7-flash")
     fallback_model_name: str = os.getenv("OPENAI_MODEL", "gpt-5")
     # Backup Gemini models tried when the primary is overloaded (503) or rate limited (429).
     gemini_fallback_models: tuple = tuple(
-        m.strip() for m in os.getenv("GEMINI_FALLBACK_MODELS", "gemini-2.5-flash-lite,gemini-flash-latest").split(",") if m.strip()
+        m.strip() for m in os.getenv("GEMINI_FALLBACK_MODELS", "gemini-3.5-flash,gemini-flash-latest,gemini-3.5-flash-lite").split(",") if m.strip()
     )
     temperature: float = 0.85
 

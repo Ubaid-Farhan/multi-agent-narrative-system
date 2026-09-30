@@ -1,7 +1,20 @@
 import { API_BASE } from '../lib/api';
 
-// Shared by the admin screens.
-export const inputCls = 'w-full bg-gray-900 border border-white/15 rounded-lg px-3 py-2 text-sm text-gray-100 placeholder:text-gray-500 focus:outline-none focus:border-amber-500/70';
+// Shared by the admin screens (ERP-2.0 design system: light cards, one accent colour = amber).
+export const inputCls = 'w-full px-3 py-2.5 text-sm bg-gray-50 border border-slate-200 rounded-lg text-slate-900 placeholder:text-slate-400 outline-none transition focus:bg-white focus:ring-2 focus:ring-slate-900/10 focus:border-slate-400 disabled:bg-slate-100 disabled:text-slate-400';
+// Single-line inputs and selects.
+export const fieldCls = `${inputCls} h-11`;
+
+export const cardCls = 'bg-white rounded-2xl border border-gray-100 shadow-sm hover:shadow-lg transition-shadow';
+
+const btnBase = 'inline-flex items-center justify-center gap-1.5 rounded-lg text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed';
+export const btn = {
+  primary: `${btnBase} px-4 h-10 bg-amber-700 text-white hover:bg-amber-800`,
+  secondary: `${btnBase} px-3.5 h-10 bg-white border border-slate-200 text-slate-600 hover:bg-slate-50`,
+  ghost: `${btnBase} px-3 h-10 text-slate-600 hover:bg-slate-100`,
+  danger: `${btnBase} px-3.5 h-10 bg-rose-50 text-rose-600 border border-rose-100 hover:bg-rose-600 hover:text-white`,
+  small: `${btnBase} px-2.5 h-8 text-xs bg-white border border-slate-200 text-slate-600 hover:bg-slate-50`,
+};
 
 export async function api(path, { token, method = 'GET', body } = {}) {
   const res = await fetch(`${API_BASE}${path}`, {
