@@ -1,0 +1,15 @@
+Multi-Agent Narrative System: AI characters that argue, bargain, cry, bribe and improvise their way through a live street scene. Every run is a new story. Type one sentence and the AI writes the whole cast. A Director agent runs the arc and invents a twist, a Reviewer agent rejects lines that aren't realistic, and the scene streams live in Roman Urdu or English, with a voice for every character.
+
+Chapters:
+0:00 One sentence in
+0:03 What it is
+0:08 01 The setup: a scene, four characters, clashing goals
+0:16 02 How a turn works: Director → Character → Reviewer → Memory + world → Conclusion
+0:23 03 Inside one turn: reasoning, decision, dialogue, action (JSON)
+0:31 04 Quality control: Reviewer + anti-repetition
+0:36 05 The Director's arc and the turn-9 twist
+0:41 06 Watch it live
+0:46 07 New with AI: one line becomes a full scenario
+0:53 08 Admin panel: edit everything, no code
+0:57 09 Always on: model fallbacks + saved-story replay
+1:01 Tech stack: LangGraph, FastAPI + SSE, React 19, Gemini, gpt-oss, Edge TTS, Neon Postgres
