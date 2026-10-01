@@ -872,7 +872,7 @@ function GenerateDialog({ token, aiImages, onClose, onCreated }) {
 
   return (
     <Modal size="max-w-2xl" title="New scenario with AI" onClose={onClose} closeDisabled={running}
-      subtitle="Describe the scene in a line or two. The AI writes the story seed, setting, characters with deep personas, and adapts every prompt. You add images afterwards."
+      subtitle={`Describe the scene in a line or two. The AI writes the story seed, setting, characters with deep personas, and adapts every prompt.${withImages ? ' It can also draw every character and the background.' : ' You add images afterwards.'}`}
       footer={(
         <>
           <button type="button" onClick={() => (running ? abortRef.current?.abort() : onClose())} className={btn.secondary}>{running ? 'Stop' : 'Cancel'}</button>
@@ -1031,7 +1031,7 @@ function Sidebar({ open, onClose, view, onView, scenarios, loading, scenarioId, 
         <div className="px-5 pt-4 pb-3 border-t border-gray-100 shrink-0 space-y-3">
           <div className="flex items-center justify-between">
             <span className="text-xs font-semibold uppercase tracking-wide text-slate-400">All scenarios</span>
-            <span className="text-xs text-slate-400">{scenarios.length}</span>
+            <span className="text-xs text-slate-400">{loading ? '' : scenarios.length}</span>
           </div>
           <div className="relative">
             <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
