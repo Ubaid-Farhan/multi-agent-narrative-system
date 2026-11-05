@@ -1,0 +1,5 @@
+# HyperFrames local preview and render diagnostics
+composition/.hyperframes/
+composition/.thumbnails/
+composition/.waveform-cache/
+composition/renders/
